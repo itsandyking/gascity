@@ -13,7 +13,7 @@ builds:
     # canonical {{ .Version }} (see snapshot.version_template) so the RC formula
     # keeps matching gascity_<version>_*.
     ldflags:
-      - -s -w -X main.version={{ .Tag }} -X main.commit={{ .Commit }} -X main.date={{ .Date }} -X github.com/gastownhall/gascity/internal/productmetrics.compiledReleaseTag={{ if .IsSnapshot }}{{ .Version }}-canary-{{ .ShortCommit }}{{ else }}{{ .Version }}{{ end }}
+      - -s -w -X main.version={{ .Tag }} -X main.commit={{ .Commit }} -X main.branch={{ .Branch }} -X main.date={{ .Date }} -X github.com/gastownhall/gascity/internal/productmetrics.compiledReleaseTag={{ if .IsSnapshot }}{{ .Version }}-canary-{{ .ShortCommit }}{{ else }}{{ .Version }}{{ end }}
     goos:
       - linux
       - darwin
