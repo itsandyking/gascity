@@ -63,6 +63,65 @@ func isSessionScaffoldRoot(path string) bool {
 	return err == nil && info.IsDir()
 }
 
+func TestSessionScaffoldRootRequiresGCMarkerDirectory(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+		want  bool
+	}{
+		{
+			name: "gc marker directory",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(path, ".gc"), 0o755); err != nil {
+					t.Fatalf("creating .gc marker directory: %v", err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "no gc marker",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatalf("creating candidate directory: %v", err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "gc marker file",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatalf("creating candidate directory: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(path, ".gc"), []byte("not a directory"), 0o644); err != nil {
+					t.Fatalf("creating .gc marker file: %v", err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "missing path",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "candidate")
+			if tt.setup != nil {
+				tt.setup(t, path)
+			}
+
+			if got := isSessionScaffoldRoot(path); got != tt.want {
+				t.Fatalf("isSessionScaffoldRoot(%q) = %v, want %v", path, got, tt.want)
+			}
+		})
+	}
+}
+
 // knownBrokenLinks lists links to docs that do not exist yet. These are
 // excluded from TestLocalMarkdownLinks failures but still logged. Remove
 // entries as the missing docs are created.
