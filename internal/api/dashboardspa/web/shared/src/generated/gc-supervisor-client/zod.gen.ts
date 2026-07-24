@@ -1399,6 +1399,8 @@ export const zRotatedPayload = z.object({
 
 export const zRoutedDemandStrandedPayload = z.object({
     bead_ids: z.array(z.string()).nullish(),
+    escalated: z.boolean(),
+    first_seen: z.string().optional(),
     severity: z.string(),
     template: z.string().optional()
 });
