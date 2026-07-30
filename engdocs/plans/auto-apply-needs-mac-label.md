@@ -6,9 +6,10 @@ Incident source: `ga-xbilek` / PR #4844 / `d2142785f`
 
 ## Outcome
 
-Proceed with a narrow, add-only path policy only if `ga-77idy2.4` identifies a
-safe end-to-end event chain. The path and lifecycle policy is settled below,
-but the implementation is not builder-ready yet.
+Build the narrow, add-only path policy. Architecture child `ga-77idy2.4`
+approved an end-to-end event chain that uses only `github.token`, executes
+only base-controlled workflow code, and dispatches the qualifying revision
+explicitly after applying the visible label.
 
 The architecture handoff assumed that a workflow could add `needs-mac` with
 the repository `GITHUB_TOKEN` and thereby wake
@@ -19,10 +20,12 @@ workflow run. The original `pull_request` event also contains the pre-label
 payload. A one-push PR could therefore display `needs-mac` while Mac Regression
 never runs for that revision.
 
-The automation is a go only if the architecture child can preserve the visible
-label and existing trust boundary without exposing write credentials to PR
-code or silently duplicating authorization logic. Otherwise the outcome is to
-keep `needs-mac` manual and document the curated candidate list.
+The approved response is to extend
+`.github/workflows/dispatch-labeled-pr-suite.yml` with a second
+`pull_request_target` job for the PR lifecycle events. That job evaluates the
+path policy, adds the label, reuses extracted shared author-trust logic, and
+calls `workflow_dispatch` itself for a trusted, non-draft same-repository PR.
+It does not depend on the suppressed token-caused `labeled` event.
 
 ## Why the path list is narrow
 
@@ -86,33 +89,51 @@ The original incident remains a mandatory positive fixture:
 
 ## Permission and trust boundary
 
-For label mutation alone, `pull-requests: write` is sufficient;
-`contents: read` is the only additional permission that may be needed for the
-chosen path-evaluation mechanism. Those permissions are not, by themselves,
-an end-to-end solution: a label written with `GITHUB_TOKEN` does not wake the
-existing `pull_request_target: labeled` dispatcher.
+`ga-77idy2.4` settled the complete chain:
 
-`ga-77idy2.4` must decide the complete event chain and specify:
+- Extend the existing `pull_request_target` workflow to listen for `opened`,
+  `reopened`, `synchronize`, and `ready_for_review`, while retaining `labeled`.
+- Keep the current `dispatch-suite` job limited explicitly to `labeled`.
+- Add an `auto-label-path-sensitive` job for the other actions. It rejects
+  forks before doing work, checks out only `base.sha` with persisted
+  credentials disabled, and lists changed files through the pull-request API.
+- On a match, add `needs-mac` idempotently. A draft stops after labeling, so
+  `ready_for_review` can reevaluate it later.
+- Extract the existing association/allowlist decision into
+  `.github/workflows/scripts/pr_trust_check.py` and call that same logic from
+  both jobs. Do not create a second authorization policy.
+- For a trusted non-draft PR, check for an in-flight or queued
+  `mac-regression.yml` run at the exact head SHA, then dispatch
+  `suite: needs-mac` with the existing PR/head inputs when none exists.
+- Give the new job PR-scoped, cancel-in-progress concurrency so rapid
+  synchronize events do not pile up, without sharing a group with the
+  human-labeled job.
 
-- token provenance and minimum permissions;
-- whether workflow code comes from the trusted base or PR head;
-- same-repo, fork, and draft behavior;
-- how the first qualifying revision dispatches exactly once;
-- concurrency and duplicate-run behavior; and
-- whether a GitHub App, PAT, secret, or operator action is required.
+Permissions stay job-scoped:
 
-The architecture child may choose a manual-only outcome. Downstream agents must
-not invent a direct dispatch, new secret, or second trust check to work around
-that decision.
+- Existing `dispatch-suite`: `actions: write`, `contents: read`,
+  `pull-requests: read`.
+- New path-sensitive job: `actions: write`, `contents: read`,
+  `pull-requests: write`.
+
+The token is `github.token`. No PAT, GitHub App, new secret, or operator action
+is needed. No PR-head code is checked out or executed with write credentials.
+Fork PRs retain the existing manual-label path.
+
+A qualifying trusted push is expected to create two workflow records: the
+natural `pull_request` run, whose event snapshot predates the label and
+correctly does not run a tier, and the explicit `workflow_dispatch` run that
+executes the Mac suite. The head-SHA guard prevents two real dispatched suites;
+the inert PR record is not a duplicate Mac execution.
 
 ## Child beads
 
 | Order | Bead | Route | Purpose |
 | --- | --- | --- | --- |
-| 1 | `ga-77idy2.4` | `gascity/architect` | Resolve the `GITHUB_TOKEN` label-event suppression and issue a buildable or manual-only decision |
+| 1 | `ga-77idy2.4` | `gascity/architect` | Closed: approved the composed label-and-dispatch job with no new credential |
 | 2 | `ga-77idy2.1` | `gascity/validator` | Pin the approved end-to-end chain, narrow path matrix, lifecycle, and security invariants |
-| 3 | `ga-77idy2.2` | `gascity/builder` | Implement the approved automatic-label path, or close superseded on a manual-only decision |
-| 4 | `ga-77idy2.3` | `gascity/builder` | Document automatic behavior after implementation, or document the manual policy if automation is deferred |
+| 3 | `ga-77idy2.2` | `gascity/builder` | Implement the approved automatic label plus trusted explicit dispatch |
+| 4 | `ga-77idy2.3` | `gascity/builder` | Document the automatic behavior and manual fork fallback |
 
 Dependency graph:
 
@@ -123,9 +144,10 @@ ga-77idy2.4
             -> ga-77idy2.3
 ```
 
-Only `ga-77idy2.4` is ready to dispatch now. The validator had already claimed
-`ga-77idy2.1` during the interrupted first PM pass and has been notified to
-pause on the new architecture dependency.
+`ga-77idy2.4` is closed. The validator had already claimed `ga-77idy2.1`
+during the interrupted first PM pass; it is now unblocked and has been
+notified to resume against the architecture decision. The builder beads remain
+blocked in order.
 
 Duplicate children `ga-77idy2.5` and `ga-77idy2.6` were created during recovery
 before the earlier children were discovered; both are closed as superseded.
