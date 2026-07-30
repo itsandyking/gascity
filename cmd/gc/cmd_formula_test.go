@@ -56,8 +56,9 @@ func TestResolveFormulaScope_RigFlagWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
-	if scope.storeRoot != rigPath {
-		t.Errorf("storeRoot = %q, want %q", scope.storeRoot, rigPath)
+	wantStoreRoot := canonicalTestPath(rigPath)
+	if scope.storeRoot != wantStoreRoot {
+		t.Errorf("storeRoot = %q, want canonical path %q", scope.storeRoot, wantStoreRoot)
 	}
 	want := []string{"/city/formulas", "/rigs/my-project/formulas"}
 	if !reflect.DeepEqual(scope.searchPaths, want) {
@@ -96,8 +97,9 @@ func TestResolveFormulaScope_CwdInsideRig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
-	if scope.storeRoot != rigPath {
-		t.Errorf("storeRoot = %q, want %q", scope.storeRoot, rigPath)
+	wantStoreRoot := canonicalTestPath(rigPath)
+	if scope.storeRoot != wantStoreRoot {
+		t.Errorf("storeRoot = %q, want canonical path %q", scope.storeRoot, wantStoreRoot)
 	}
 	want := []string{"/city/formulas", "/rigs/my-project/formulas"}
 	if !reflect.DeepEqual(scope.searchPaths, want) {
@@ -263,8 +265,9 @@ func TestResolveFormulaScope_RigFallsBackToCityLayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveFormulaScope: %v", err)
 	}
-	if scope.storeRoot != rigPath {
-		t.Errorf("storeRoot = %q, want %q", scope.storeRoot, rigPath)
+	wantStoreRoot := canonicalTestPath(rigPath)
+	if scope.storeRoot != wantStoreRoot {
+		t.Errorf("storeRoot = %q, want canonical path %q", scope.storeRoot, wantStoreRoot)
 	}
 	want := []string{"/city/formulas"}
 	if !reflect.DeepEqual(scope.searchPaths, want) {
