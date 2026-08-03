@@ -4,33 +4,36 @@
 - Build bead: `ga-jav9u9`
 - Source review: `ga-mfccbk`
 - Reviewed commit: `941812ce44b193ebfc3ab3903861bcf79467e3e3`
-- Reviewed base: `1f948e67b0ac088492af67c0748f521aad5768b0`
-- Main evaluated: `origin/main@3b4e9ea98a636f3cf2a0db5945f03de69e9fb651`
-- Source branch: `builder/ga-jav9u9` (provenance and bounded-rebase target only)
+- Gated source tip: `6384e9a82b0950a219041fa0efe121dec40aea8b`
+- Main evaluated: `origin/main@85e3e5022b925c9781fb64e0b1a043133770cf72`
+- Source branch: `builder/ga-jav9u9`
 - Planned deploy branch: `deploy/ga-d6zqfj-gate`
 - Evaluated: `2026-08-03`
 - Overall verdict: **FAIL**
 
-`docs/PROJECT_MANIFEST.md` is not present at the evaluated commit, so this
-checklist applies the deployer role's release-gate criteria together with
+`docs/PROJECT_MANIFEST.md` is not present at the evaluated commit. This
+checklist therefore applies the deployer role's seven release criteria and
 `engdocs/contributors/release-gate-criteria-conventions.md`.
 
-Evaluation stopped after criterion 6 as required. No test suite, push of the
-deploy branch, or pull request was attempted.
+The builder rebased the reviewed RED and GREEN commits onto current main after
+the prior gate attempt. Their stable patch IDs are unchanged (`1069edfc...` and
+`0f232508...` respectively), so the gated source contains the same reviewed
+feature patch plus the prior gate record.
 
 | # | Criterion | Result | Evidence |
 |---|---|---|---|
-| 6 | Branch diverges cleanly from main | **FAIL** | Evaluated first after `git fetch origin main`. `origin/main@3b4e9ea98a636f3cf2a0db5945f03de69e9fb651` was not an ancestor of reviewed commit `941812ce44b193ebfc3ab3903861bcf79467e3e3` (merge base `1f948e67b0ac088492af67c0748f521aad5768b0`). `git merge-tree --write-tree origin/main 941812ce44b193ebfc3ab3903861bcf79467e3e3` was conflict-free and produced tree `e2f8444bf610d36846c6ccdd1d5f46ed917a64e0`, so the permitted bounded helper was attempted on the internally authored source branch. It rebased locally to `08f5fff1d0499cba7a8963402915932b42ea19f2`, but returned `rc=14`: `push-ownership-guard` resolved the branch to closed build bead `ga-jav9u9` and blocked the required force-with-lease push. Remote `origin/builder/ga-jav9u9` therefore remains at `941812ce44b193ebfc3ab3903861bcf79467e3e3`. Per the guardrail, a locally rebased but unpushed source is not a criterion-6 PASS. |
-| 1 | Review PASS present | **SKIPPED** | Fail-fast after criterion 6. The review bead was not promoted into gate evidence. |
-| 2 | Acceptance criteria met | **SKIPPED** | Fail-fast after criterion 6; acceptance criteria were not re-evaluated. |
-| 3 | Tests pass | **SKIPPED** | Fail-fast after criterion 6. The documented CI-equivalent command for this `cmd/gc/**` change is `make test-cmd-gc-process-parallel`, but it was intentionally not run on an unpushable rebased source. PASS/FAIL/SKIP counts are therefore not claimed. |
-| 4 | No high-severity review findings open | **SKIPPED** | Fail-fast after criterion 6. |
-| 5 | Final branch is clean | **SKIPPED** | Fail-fast after criterion 6. The helper left the temporary source worktree clean before this checklist was written, but cleanliness is not promoted to a gate PASS after criterion 6 failed. |
-| 7 | Single feature theme | **SKIPPED** | Fail-fast after criterion 6. |
+| 6 | Branch diverges cleanly from main | **PASS** | Evaluated first after `git fetch origin main builder/ga-jav9u9`. `origin/main@85e3e5022b925c9781fb64e0b1a043133770cf72` is an ancestor of the clean source tip `6384e9a82b0950a219041fa0efe121dec40aea8b`, which exactly matched `origin/builder/ga-jav9u9`; merge base was the current main tip and `git diff --check origin/main...HEAD` was clean. No bounded self-rebase was required. |
+| 1 | Review PASS present | **PASS** | Review bead `ga-mfccbk` is closed with `close_reason=pass`, `verdict: pass`, and reviewed commit `941812ce44b193ebfc3ab3903861bcf79467e3e3`. The rebased RED/GREEN commits have stable patch IDs identical to the reviewed commits. |
+| 2 | Acceptance criteria met | **PASS** | `cmd/gc/template_resolve.go` sets `BEADS_ACTOR` to `qualifiedName`, matching `GC_ALIAS`, rather than the per-session `sessName`. `TestResolveTemplateSetsBeadsActorToQualifiedNameNotSessionName` passed independently: 1 PASS, 0 FAIL, 0 SKIP. |
+| 3 | Tests pass | **FAIL** | Required path-matched local CI equivalent `make test-cmd-gc-process-parallel`: 4/7 jobs PASS (`cmd-gc-process` shards 1, 3, 6 plus `productmetrics-testhook`), 3/7 FAIL (shards 2, 4, 5), 0 jobs SKIP; exit 123. Failing tests were `TestBuildDesiredState_MinZeroDefaultScaleCheckRoutedWorkCreatesPoolSession`, `TestEvaluatePoolDefaultScaleCheckCountsRoutedReadyWork`, and `TestEvaluatePoolDefaultScaleCheckIgnoresRoutedActiveUnassignedWork`. Two failures explicitly report `database "beads" not found on Dolt server at 127.0.0.1:3308`; the third reports its generated `bd ready` command exiting 1. Logs: `/var/tmp/gc-local-tests.r4VqAA/cmd-gc-process-{2,4,5}-of-6.log`. Per test-evidence policy, this red required run cannot be promoted to PASS even though the feature-focused test is green. Remaining path-matched integration and worker-core lanes were not run after the required process suite failed. |
+| 4 | No high-severity review findings open | **PASS** | Review bead `ga-mfccbk` records no style or security findings and no blocker/major/minor security issue; unresolved HIGH count is 0. |
+| 5 | Final branch is clean | **PASS** | The source worktree was clean at `6384e9a82b0950a219041fa0efe121dec40aea8b` before this checklist was written; the gate record is committed below as the only deployer change. |
+| 7 | Single feature theme | **PASS** | The substantive diff is confined to `cmd/gc` agent-environment identity construction, its focused regression test, and one directly related test comment. The prior gate record is release evidence for the same feature, not an independent theme. |
 
 ## Required remediation
 
-The builder must re-establish a pushable source branch on current `origin/main`
-and return it for review/deploy. The deployer must then rerun the complete gate,
-including `make test-cmd-gc-process-parallel`, before preparing an isolated
-`deploy/ga-d6zqfj-gate` branch or opening a pull request.
+The builder must make the documented `cmd/gc` process suite pass on the exact
+source tip, including isolating the three pool tests from the ambient Dolt
+endpoint or otherwise proving and repairing the failing test environment. The
+deployer must rerun the full gate before creating or pushing an isolated deploy
+branch. No deploy branch was pushed and no pull request was opened.
