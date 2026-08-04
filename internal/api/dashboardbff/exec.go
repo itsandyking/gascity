@@ -127,9 +127,19 @@ func (r *execRunner) runWithEnv(ctx context.Context, cmd string, args []string, 
 // the credential-free cleanEnv environment.
 func cleanBdEnv() []string {
 	env := cleanEnv()
-	for _, key := range []string{"BEADS_DOLT_SERVER_USER", "BEADS_DOLT_PASSWORD"} {
-		if value, ok := os.LookupEnv(key); ok {
-			env = append(env, key+"="+value)
+	for _, credential := range []struct {
+		beadsKey string
+		gcKey    string
+	}{
+		{beadsKey: "BEADS_DOLT_SERVER_USER", gcKey: "GC_DOLT_USER"},
+		{beadsKey: "BEADS_DOLT_PASSWORD", gcKey: "GC_DOLT_PASSWORD"},
+	} {
+		value := os.Getenv(credential.beadsKey)
+		if value == "" {
+			value = os.Getenv(credential.gcKey)
+		}
+		if value != "" {
+			env = append(env, credential.beadsKey+"="+value)
 		}
 	}
 	return env

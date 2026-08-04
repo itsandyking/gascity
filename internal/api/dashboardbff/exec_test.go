@@ -9,27 +9,82 @@ import (
 	"testing"
 )
 
-func TestCleanBdEnvScopesDoltCredentialsToBdProbe(t *testing.T) {
-	t.Setenv("BEADS_DOLT_SERVER_USER", "health-reader")
-	t.Setenv("BEADS_DOLT_PASSWORD", "test-password")
-	t.Setenv("GITHUB_TOKEN", "must-not-leak")
+func TestCleanBdEnvFallsBackToSupervisorDoltCredentials(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_USER", "")
+	t.Setenv("BEADS_DOLT_PASSWORD", "")
+	t.Setenv("GC_DOLT_USER", "supervisor-reader")
+	t.Setenv("GC_DOLT_PASSWORD", "supervisor-password")
 
-	env := cleanBdEnv()
-	joined := "\n" + strings.Join(env, "\n") + "\n"
-	for _, want := range []string{
-		"\nBEADS_DOLT_SERVER_USER=health-reader\n",
-		"\nBEADS_DOLT_PASSWORD=test-password\n",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("cleanBdEnv() missing %q", strings.TrimSpace(want))
+	env := envMap(cleanBdEnv())
+	if got := env["BEADS_DOLT_SERVER_USER"]; got != "supervisor-reader" {
+		t.Fatalf("BEADS_DOLT_SERVER_USER = %q, want supervisor fallback", got)
+	}
+	if got := env["BEADS_DOLT_PASSWORD"]; got != "supervisor-password" {
+		t.Fatalf("BEADS_DOLT_PASSWORD = %q, want supervisor fallback", got)
+	}
+	for _, key := range []string{"GC_DOLT_USER", "GC_DOLT_PASSWORD"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("cleanBdEnv() leaked supervisor credential %s", key)
 		}
 	}
-	if strings.Contains(joined, "GITHUB_TOKEN=") {
+}
+
+func TestCleanBdEnvPrefersExplicitBeadsDoltCredentials(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_USER", "health-reader")
+	t.Setenv("BEADS_DOLT_PASSWORD", "test-password")
+	t.Setenv("GC_DOLT_USER", "supervisor-reader")
+	t.Setenv("GC_DOLT_PASSWORD", "supervisor-password")
+	t.Setenv("GITHUB_TOKEN", "must-not-leak")
+
+	env := envMap(cleanBdEnv())
+	if got := env["BEADS_DOLT_SERVER_USER"]; got != "health-reader" {
+		t.Fatalf("BEADS_DOLT_SERVER_USER = %q, want explicit beads credential", got)
+	}
+	if got := env["BEADS_DOLT_PASSWORD"]; got != "test-password" {
+		t.Fatalf("BEADS_DOLT_PASSWORD = %q, want explicit beads credential", got)
+	}
+	if _, ok := env["GITHUB_TOKEN"]; ok {
 		t.Fatal("cleanBdEnv() leaked GITHUB_TOKEN")
 	}
-	if strings.Contains("\n"+strings.Join(cleanEnv(), "\n")+"\n", "BEADS_DOLT_PASSWORD=") {
-		t.Fatal("cleanEnv() leaked Dolt credentials to non-bd probes")
+	for _, key := range []string{"GC_DOLT_USER", "GC_DOLT_PASSWORD"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("cleanBdEnv() leaked supervisor credential %s", key)
+		}
 	}
+}
+
+func TestCleanEnvExcludesDoltCredentialsFromGenericProbes(t *testing.T) {
+	for key, value := range map[string]string{
+		"BEADS_DOLT_SERVER_USER": "health-reader",
+		"BEADS_DOLT_PASSWORD":    "beads-password",
+		"GC_DOLT_USER":           "supervisor-reader",
+		"GC_DOLT_PASSWORD":       "supervisor-password",
+	} {
+		t.Setenv(key, value)
+	}
+
+	env := envMap(cleanEnv())
+	for _, key := range []string{
+		"BEADS_DOLT_SERVER_USER",
+		"BEADS_DOLT_PASSWORD",
+		"GC_DOLT_USER",
+		"GC_DOLT_PASSWORD",
+	} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("cleanEnv() leaked Dolt credential %s to generic probes", key)
+		}
+	}
+}
+
+func envMap(env []string) map[string]string {
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	return values
 }
 
 func TestExecBdDoctorRejectsBeadsDirectoryAsRigPath(t *testing.T) {
