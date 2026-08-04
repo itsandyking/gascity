@@ -409,7 +409,7 @@ func (m *samplerManager) probeRig(ctx context.Context, rigName, rigPath string) 
 
 	var checks []rigStoreCheck
 	var note string
-	if res, err := m.exec.execBdDoctor(ctx, beadsPath); err != nil {
+	if res, err := m.exec.execBdDoctor(ctx, rigPath); err != nil {
 		note = "bd doctor probe failed: " + err.Error()
 	} else if parsed, ok := parseDoctorChecks(res.stdout); ok {
 		checks = parsed

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -64,6 +65,13 @@ func newExecRunner() *execRunner {
 // timeout, or spawn failure; a non-zero exit code is reported in the result,
 // not as an error.
 func (r *execRunner) run(ctx context.Context, cmd string, args []string, timeout time.Duration, capBytes int) (*execResult, error) {
+	return r.runWithEnv(ctx, cmd, args, timeout, capBytes, cleanEnv())
+}
+
+// runWithEnv runs with an explicit, caller-scoped environment. Keep secret
+// forwarding out of run: git probes share that path and must never inherit
+// database credentials from the dashboard host.
+func (r *execRunner) runWithEnv(ctx context.Context, cmd string, args []string, timeout time.Duration, capBytes int, env []string) (*execResult, error) {
 	if capBytes <= 0 {
 		capBytes = maxBytes
 	}
@@ -79,7 +87,7 @@ func (r *execRunner) run(ctx context.Context, cmd string, args []string, timeout
 
 	start := time.Now()
 	c := exec.CommandContext(cctx, cmd, args...)
-	c.Env = cleanEnv()
+	c.Env = env
 	stdout := &cappedBuffer{limit: capBytes, onOverflow: cancel}
 	stderr := &cappedBuffer{limit: maxBytes}
 	c.Stdout = stdout
@@ -111,6 +119,20 @@ func (r *execRunner) run(ctx context.Context, cmd string, args []string, timeout
 		truncated: stdout.truncated,
 		duration:  dur,
 	}, nil
+}
+
+// cleanBdEnv extends the general sandbox with only the credentials bd needs to
+// open a configured shared Dolt database. These values are intentionally scoped
+// to the bd doctor subprocess; git and other request-influenced probes retain
+// the credential-free cleanEnv environment.
+func cleanBdEnv() []string {
+	env := cleanEnv()
+	for _, key := range []string{"BEADS_DOLT_SERVER_USER", "BEADS_DOLT_PASSWORD"} {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
 }
 
 // cappedBuffer accumulates output up to limit bytes, then marks itself
@@ -259,12 +281,14 @@ func (r *execRunner) execGitLog(ctx context.Context, view string) (*execResult, 
 	return r.run(ctx, "git", gitArgs(gitRepoPath(), args...), gitLogTimeout, maxBytes)
 }
 
-// execBdDoctor runs a read-only `bd doctor` health probe of a rig's embedded
-// dolt .beads store. The path is supervisor-reported and validated here; --fix
-// is never passed, so the probe only inspects.
-func (r *execRunner) execBdDoctor(ctx context.Context, beadsPath string) (*execResult, error) {
-	if !isValidHostPath(beadsPath) || !strings.HasSuffix(beadsPath, "/.beads") {
-		return nil, validationErr("invalid beads store path")
+// execBdDoctor runs a read-only `bd doctor` health probe in a rig repository.
+// bd's --db flag names a concrete database, not a .beads directory; using it
+// with <rig>/.beads bypasses the repository config and makes shared-server
+// stores look unavailable. Run with -C so bd discovers the rig's own config.
+func (r *execRunner) execBdDoctor(ctx context.Context, rigPath string) (*execResult, error) {
+	if !isValidHostPath(rigPath) || filepath.Base(filepath.Clean(rigPath)) == ".beads" {
+		return nil, validationErr("invalid rig path")
 	}
-	return r.run(ctx, "bd", []string{"doctor", "--readonly", "--db", beadsPath, "--json"}, bdDoctorTimeout, maxBytes)
+	args := []string{"doctor", "--readonly", "--json", "-C", rigPath}
+	return r.runWithEnv(ctx, "bd", args, bdDoctorTimeout, maxBytes, cleanBdEnv())
 }
