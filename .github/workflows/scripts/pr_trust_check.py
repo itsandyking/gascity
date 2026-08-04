@@ -3,7 +3,7 @@
 
 A PR author is trusted when their author_association with this repository is
 OWNER, MEMBER, or COLLABORATOR, or when their login appears in
-.github/blacksmith-allowlist.txt. Reads PR_AUTHOR and PR_ASSOCIATION from the
+.github/blacksmith-allowlist.txt. Reads PR_LOGIN and PR_ASSOCIATION from the
 environment so callers never have to duplicate this policy inline. Exits 0
 when trusted, 1 when not.
 """
@@ -26,19 +26,19 @@ def load_allowlist(path: Path) -> set[str]:
     return allowlist
 
 
-def is_trusted(author: str, association: str, allowlist: set[str]) -> bool:
-    normalized_author = author.strip().lower()
+def is_trusted(login: str, association: str, allowlist: set[str]) -> bool:
+    normalized_login = login.strip().lower()
     normalized_association = association.strip().upper()
-    return normalized_association in TRUSTED_ASSOCIATIONS or normalized_author in allowlist
+    return normalized_association in TRUSTED_ASSOCIATIONS or normalized_login in allowlist
 
 
 def main() -> int:
-    author = os.environ.get("PR_AUTHOR", "")
+    login = os.environ.get("PR_LOGIN", "")
     association = os.environ.get("PR_ASSOCIATION", "")
     allowlist = load_allowlist(ALLOWLIST_PATH)
-    trusted = is_trusted(author, association, allowlist)
+    trusted = is_trusted(login, association, allowlist)
     print(
-        f"author={author or '<unknown>'} association={association or '<unknown>'} "
+        f"login={login or '<unknown>'} association={association or '<unknown>'} "
         f"trusted={str(trusted).lower()}"
     )
     return 0 if trusted else 1

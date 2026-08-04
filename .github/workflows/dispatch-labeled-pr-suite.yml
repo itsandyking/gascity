@@ -38,7 +38,7 @@ jobs:
           LABEL_NAME: ${{ github.event.label.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_LOGIN: ${{ github.event.pull_request.user.login }}
           PR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -53,7 +53,7 @@ jobs:
 
           label = os.environ["LABEL_NAME"]
           draft = os.environ.get("PR_DRAFT", "").lower() == "true"
-          author = os.environ.get("PR_AUTHOR", "").strip()
+          login = os.environ.get("PR_LOGIN", "").strip()
           association = os.environ.get("PR_ASSOCIATION", "").strip().upper()
 
           if draft:
@@ -62,10 +62,10 @@ jobs:
 
           trust_check = subprocess.run(
               ["python3", ".github/workflows/scripts/pr_trust_check.py"],
-              env={**os.environ, "PR_AUTHOR": author, "PR_ASSOCIATION": association},
+              env={**os.environ, "PR_LOGIN": login, "PR_ASSOCIATION": association},
           )
           if trust_check.returncode != 0:
-              print(f"PR author {author or '<unknown>'} is not trusted for label-dispatched suites")
+              print(f"PR author {login or '<unknown>'} is not trusted for label-dispatched suites")
               raise SystemExit(0)
 
           workflows = {
@@ -130,7 +130,7 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_LOGIN: ${{ github.event.pull_request.user.login }}
           PR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -214,7 +214,7 @@ jobs:
           fi
 
           if ! python3 .github/workflows/scripts/pr_trust_check.py; then
-            echo "decision=untrusted author=$PR_AUTHOR"
+            echo "decision=untrusted login=$PR_LOGIN"
             exit 0
           fi
 
