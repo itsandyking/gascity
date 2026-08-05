@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ok",
+    "taken_at",
+    "providers"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "ok": {
+      "const": true
+    },
+    "taken_at": {
+      "type": "string",
+      "description": "Instant every window in this reading was evaluated at."
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "provider",
+          "windows"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "plan": {
+            "type": "string",
+            "description": "Provider-stated account tier label. Calibration key only."
+          },
+          "source": {
+            "type": "string",
+            "description": "Where the reading came from, in terms a human can go and check."
+          },
+          "error": {
+            "type": "string",
+            "description": "Set when the provider could not be read. A provider with an error reports no windows and must not be read as idle."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "binding": {
+            "$ref": "#/$defs/window",
+            "description": "The window that constrains every request to this provider — the hottest of the ones that gate it."
+          },
+          "windows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/window"
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "window": {
+      "type": "object",
+      "required": [
+        "window",
+        "used_percent",
+        "elapsed_percent",
+        "ratio",
+        "state"
+      ],
+      "properties": {
+        "window": {
+          "type": "string"
+        },
+        "model_scope": {
+          "type": "string",
+          "description": "Model family this window gates. Absent when the window gates every request. A scoped window is a sub-cap inside the shared budget, not an independent pool."
+        },
+        "used_percent": {
+          "type": "number"
+        },
+        "elapsed_percent": {
+          "type": "number"
+        },
+        "window_seconds": {
+          "type": "number"
+        },
+        "remaining_seconds": {
+          "type": "number"
+        },
+        "burn_percent_per_hour": {
+          "type": "number"
+        },
+        "allowed_percent_per_hour": {
+          "type": "number",
+          "description": "Rate that finishes the window at exactly 100%."
+        },
+        "ratio": {
+          "type": "number",
+          "description": "burn_percent_per_hour / allowed_percent_per_hour. Meaningful only when state is ok."
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "cold-start",
+            "exhausted",
+            "expired",
+            "unknown"
+          ]
+        },
+        "resets_at": {
+          "type": "string"
+        },
+        "exhausts_at": {
+          "type": "string",
+          "description": "Straight-line projection of when used_percent reaches 100. Absent when the window never exhausts at the current burn."
+        },
+        "dead_seconds": {
+          "type": "number",
+          "description": "How long the window sits exhausted before it resets."
+        },
+        "age_seconds": {
+          "type": "number",
+          "description": "How stale the reading is. Provider signals are written asynchronously and can be materially stale."
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Fraction of the window elapsed. A projection from a thin base is arithmetic, not a forecast."
+        },
+        "source": {
+          "type": "string"
+        },
+        "inferred": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Attributes gascity derived rather than read from the provider."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

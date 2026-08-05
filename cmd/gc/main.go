@@ -376,6 +376,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newShellCmd(stdout, stderr),
 		newAnalyzeCmd(stdout, stderr),
 		newCostsCmd(stdout, stderr),
+		newQuotaCmd(stdout, stderr),
 		newGitCredentialCmd(stdout, stderr),
 		newLoginCmd(stdout, stderr),
 		newWhoamiCmd(stdout, stderr),

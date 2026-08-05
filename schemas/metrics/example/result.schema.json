@@ -207,7 +207,8 @@
               "whoami",
               "runtime-heartbeat",
               "pack-registry-requests",
-              "events-reemit-execution"
+              "events-reemit-execution",
+              "quota"
             ]
           },
           "event_id": {
