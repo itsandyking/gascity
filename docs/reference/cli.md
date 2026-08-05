@@ -65,6 +65,7 @@ gc [flags]
 | [gc pack](#gc-pack) | Manage remote pack sources |
 | [gc prime](#gc-prime) | Output the behavioral prompt for an agent |
 | [gc prompt](#gc-prompt) | Author and inspect agent prompt templates |
+| [gc quota](#gc-quota) | Show how much provider allowance is left and the pace that spends it exactly |
 | [gc register](#gc-register) | Register a city with the machine-wide supervisor |
 | [gc reload](#gc-reload) | Reload the current city's config without restarting the city/controller |
 | [gc restart](#gc-restart) | Restart all agent sessions in the city |
@@ -3211,6 +3212,51 @@ gc prompt synth [flags]
 | `--wait-timeout` | duration | `10m0s` | in slingued mode with --wait, abort after this duration |
 | `--write` | bool |  | write to &lt;city&gt;/agents/&lt;role&gt;/prompt.template.md instead of stdout (direct mode only; slingued mode always writes) |
 | `--writer-agent` | string |  | Gas City agent to delegate the synth to via mol-prompt-synth (default: empty = direct mode, no agent) |
+
+## gc quota
+
+Read each provider's own report of its remaining allowance and derive the
+rate the city may spend it at.
+
+For every window a provider states, gc quota prints how much is used, how much
+of the window has elapsed, and the ratio between them:
+
+  ratio = burn_rate / allowed_rate = (used% / elapsed) / (remaining% / time_left)
+
+  ratio &lt; 1   under pace, headroom to spend
+  ratio ~ 1   on pace to finish the window at ~100%
+  ratio &gt; 1   will exhaust before reset
+
+The ratio is dimensionless, so it compares directly across providers with
+different windows and plan types. Under-use is a failure mode too: allowance
+left unspent in a window is forfeited, not banked.
+
+Windows within a provider gate conjunctively — a request needs headroom in
+every window that covers it — so the marked window is the one that binds.
+Choosing a different model cannot dodge a provider's shared window; only
+shifting work to a different provider can.
+
+Every reading carries its age. The Codex signal is written asynchronously and
+is routinely tens of minutes stale; acting on a ratio without its age is acting
+on a number that may already have moved.
+
+This is a read. It changes nothing and holds no pacing policy: what to do about
+a hot ratio is a judgment call for whoever is routing work.
+
+```
+gc quota [flags]
+```
+
+**Example:**
+
+```
+gc quota
+gc quota --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit the reading as JSON |
 
 ## gc register
 
