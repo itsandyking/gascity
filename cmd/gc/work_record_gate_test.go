@@ -425,6 +425,397 @@ func TestRunWorkRecordCloseGateReusesPreOpenedStore(t *testing.T) {
 	}
 }
 
+// passingPassCloseChecks returns injected pass-close predicates describing a
+// fully healthy repo state: the commit exists on a branch and the tree is
+// clean. Tests override individual fields to simulate each violation.
+func passingPassCloseChecks() passCloseChecks {
+	return passCloseChecks{
+		commitExists:      func(string) bool { return true },
+		commitOnAnyBranch: func(string) bool { return true },
+		dirtyPaths:        func() ([]string, error) { return nil, nil },
+	}
+}
+
+// failingPassCloseChecks returns predicates that fail every check, used to
+// prove non-pass outcomes never consult the repo at all.
+func failingPassCloseChecks() passCloseChecks {
+	return passCloseChecks{
+		commitExists:      func(string) bool { return false },
+		commitOnAnyBranch: func(string) bool { return false },
+		dirtyPaths:        func() ([]string, error) { return []string{"wip.txt"}, nil },
+	}
+}
+
+func TestValidatePassCloseOnClose(t *testing.T) {
+	tests := []struct {
+		name      string
+		meta      map[string]string
+		checks    passCloseChecks
+		wantViols []string // substring per expected violation, in order; empty ⇒ none
+	}{
+		{
+			name:      "no outcome is exempt",
+			meta:      map[string]string{},
+			checks:    failingPassCloseChecks(),
+			wantViols: nil,
+		},
+		{
+			name:      "fail outcome is exempt",
+			meta:      map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomeFail},
+			checks:    failingPassCloseChecks(),
+			wantViols: nil,
+		},
+		{
+			name:      "skipped outcome is exempt",
+			meta:      map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped},
+			checks:    failingPassCloseChecks(),
+			wantViols: nil,
+		},
+		{
+			name: "pass with reachable commit and clean tree passes",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "abc123",
+			},
+			checks:    passingPassCloseChecks(),
+			wantViols: nil,
+		},
+		{
+			name:      "pass without work commit is refused",
+			meta:      map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass},
+			checks:    passingPassCloseChecks(),
+			wantViols: []string{"requires " + beadmeta.WorkCommitMetadataKey},
+		},
+		{
+			name: "pass with nonexistent commit is refused",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "deadbeef",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.commitExists = func(string) bool { return false }
+				return c
+			}(),
+			wantViols: []string{"does not exist"},
+		},
+		{
+			name: "pass with detached-HEAD-only commit is refused",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "abc123",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.commitOnAnyBranch = func(string) bool { return false }
+				return c
+			}(),
+			wantViols: []string{"not reachable from any branch"},
+		},
+		{
+			name: "pass with dirty non-infrastructure tree is refused",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "abc123",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) { return []string{".agents/state.json", "internal/foo.go"}, nil }
+				return c
+			}(),
+			wantViols: []string{"internal/foo.go"},
+		},
+		{
+			name: "infrastructure-only dirt is clean",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "abc123",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) {
+					return []string{".agents/state.json", ".codex/session.log", ".gc/", ".gc/tmp/x"}, nil
+				}
+				return c
+			}(),
+			wantViols: nil,
+		},
+		{
+			name: "unverifiable tree is refused",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "abc123",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) { return nil, os.ErrPermission }
+				return c
+			}(),
+			wantViols: []string{"cannot verify"},
+		},
+		{
+			name: "missing commit and dirty tree report both violations",
+			meta: map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) { return []string{"wip.txt"}, nil }
+				return c
+			}(),
+			wantViols: []string{"requires " + beadmeta.WorkCommitMetadataKey, "wip.txt"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bead := beads.Bead{ID: "pc-1", Type: "task", Metadata: tc.meta}
+			got := validatePassCloseOnClose(bead, tc.checks)
+			if len(got) != len(tc.wantViols) {
+				t.Fatalf("got %d violations %v, want %d matching %v", len(got), got, len(tc.wantViols), tc.wantViols)
+			}
+			for i, want := range tc.wantViols {
+				if !strings.Contains(got[i], want) {
+					t.Fatalf("violation[%d] %q does not contain %q", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestIsPassCloseInfraPath(t *testing.T) {
+	for _, p := range []string{".agents", ".agents/state.json", ".codex/session.log", ".gc", ".gc/", ".gc/tmp/x", "./.gc/tmp"} {
+		if !isPassCloseInfraPath(p) {
+			t.Errorf("isPassCloseInfraPath(%q) = false, want true", p)
+		}
+	}
+	for _, p := range []string{"", "foo.txt", "agents/x", ".gcx/foo", ".agentsx", "sub/.gc/x", "internal/foo.go"} {
+		if isPassCloseInfraPath(p) {
+			t.Errorf("isPassCloseInfraPath(%q) = true, want false", p)
+		}
+	}
+}
+
+// newPassCloseRepo creates a git repo with one commit on main and returns its
+// path and that commit's SHA.
+func newPassCloseRepo(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "--initial-branch=main")
+	runGit(t, dir, "config", "user.name", "Gas City Test")
+	runGit(t, dir, "config", "user.email", "gc-test@test.local")
+	if err := os.WriteFile(filepath.Join(dir, "artifact.txt"), []byte("landed\n"), 0o644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	runGit(t, dir, "add", "artifact.txt")
+	runGit(t, dir, "commit", "-m", "test: land artifact")
+	return dir, strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+}
+
+// TestEvaluateWorkRecordCloseGatePassClose exercises the pass-close gate
+// end-to-end against real git repos. Every case runs with enforce=false: the
+// pass-close contract blocks unconditionally, independent of the warn-only
+// work-record migration default (GC_WORK_RECORD_ENFORCE).
+func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
+	t.Run("clean reachable pass close is allowed", func(t *testing.T) {
+		repoDir, commit := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-ok", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: commit,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ok"}, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("clean pass close blocked; stderr=%s", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "pass-close gate") {
+			t.Fatalf("unexpected pass-close gate output: %q", stderr.String())
+		}
+	})
+
+	t.Run("pass close without work commit is refused", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-nocommit", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkBranchMetadataKey: "main",
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-nocommit"}, store, nil, repoDir, false, &stderr); !block {
+			t.Fatalf("pass close without commit not blocked; stderr=%s", stderr.String())
+		}
+		for _, want := range []string{"pass-close gate", "requires " + beadmeta.WorkCommitMetadataKey, "commit the work"} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr %q does not contain %q", stderr.String(), want)
+			}
+		}
+	})
+
+	t.Run("detached-HEAD-only commit is refused", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		runGit(t, repoDir, "checkout", "--detach")
+		if err := os.WriteFile(filepath.Join(repoDir, "detached.txt"), []byte("stranded\n"), 0o644); err != nil {
+			t.Fatalf("write detached artifact: %v", err)
+		}
+		runGit(t, repoDir, "add", "detached.txt")
+		runGit(t, repoDir, "commit", "-m", "test: stranded on detached HEAD")
+		detached := strings.TrimSpace(runGit(t, repoDir, "rev-parse", "HEAD"))
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-detached", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: detached,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-detached"}, store, nil, repoDir, false, &stderr); !block {
+			t.Fatalf("detached-HEAD pass close not blocked; stderr=%s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "not reachable from any branch") {
+			t.Fatalf("stderr %q does not mention branch reachability", stderr.String())
+		}
+	})
+
+	t.Run("nonexistent commit is refused", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-bogus", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-bogus"}, store, nil, repoDir, false, &stderr); !block {
+			t.Fatalf("bogus-commit pass close not blocked; stderr=%s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "does not exist") {
+			t.Fatalf("stderr %q does not mention commit existence", stderr.String())
+		}
+	})
+
+	t.Run("dirty tree is refused", func(t *testing.T) {
+		repoDir, commit := newPassCloseRepo(t)
+		if err := os.WriteFile(filepath.Join(repoDir, "wip.txt"), []byte("uncommitted\n"), 0o644); err != nil {
+			t.Fatalf("write wip: %v", err)
+		}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-dirty", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: commit,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-dirty"}, store, nil, repoDir, false, &stderr); !block {
+			t.Fatalf("dirty-tree pass close not blocked; stderr=%s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "wip.txt") {
+			t.Fatalf("stderr %q does not name the dirty path", stderr.String())
+		}
+	})
+
+	t.Run("infrastructure-only dirt is allowed", func(t *testing.T) {
+		repoDir, commit := newPassCloseRepo(t)
+		for _, dir := range []string{".agents", ".codex", ".gc"} {
+			if err := os.MkdirAll(filepath.Join(repoDir, dir), 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", dir, err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, dir, "state.json"), []byte("{}\n"), 0o644); err != nil {
+				t.Fatalf("write %s state: %v", dir, err)
+			}
+		}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-infra", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: commit,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-infra"}, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("infrastructure-only dirt blocked the close; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("gitignored dirt is clean", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("scratch/\n"), 0o644); err != nil {
+			t.Fatalf("write gitignore: %v", err)
+		}
+		runGit(t, repoDir, "add", ".gitignore")
+		runGit(t, repoDir, "commit", "-m", "test: ignore scratch")
+		commit := strings.TrimSpace(runGit(t, repoDir, "rev-parse", "HEAD"))
+		if err := os.MkdirAll(filepath.Join(repoDir, "scratch"), 0o755); err != nil {
+			t.Fatalf("mkdir scratch: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, "scratch", "tmp.txt"), []byte("scratch\n"), 0o644); err != nil {
+			t.Fatalf("write scratch: %v", err)
+		}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-ignored", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: commit,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ignored"}, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("gitignored dirt blocked the close; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("control bead with pass outcome is exempt", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-control", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.KindMetadataKey:    beadmeta.KindCheck,
+				beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-control"}, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("control bead pass close blocked; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic update stamping pass without commit is refused", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-atomic", Type: "task", Status: "in_progress", Metadata: map[string]string{},
+		}}, nil)
+		args := []string{
+			"update", "pc-atomic",
+			"--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass,
+			"--status=closed",
+		}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); !block {
+			t.Fatalf("atomic pass close without commit not blocked; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic update stamping pass with commit resolves work dir metadata", func(t *testing.T) {
+		repoDir, commit := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-atomic-ok", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{beadmeta.WorkDirMetadataKey: repoDir},
+		}}, nil)
+		args := []string{
+			"update", "pc-atomic-ok",
+			"--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass,
+			"--set-metadata", beadmeta.WorkCommitMetadataKey + "=" + commit,
+			"--status=closed",
+		}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, store, nil, t.TempDir(), false, &stderr); block {
+			t.Fatalf("valid atomic pass close blocked; stderr=%s", stderr.String())
+		}
+	})
+}
+
 func TestWorkRecordEnforceEnabled(t *testing.T) {
 	for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
 		t.Setenv(workRecordEnforceEnvVar, v)

@@ -210,13 +210,17 @@ const (
 //     vocabulary that must not be overloaded.
 //   - WorkCommitMetadataKey ("gc.work_commit") — the commit SHA that satisfied
 //     the bead; required when the outcome is "shipped" and validated reachable
-//     on WorkBranchMetadataKey by the close gate. Named in the gc.work_* family
-//     (not a bare "gc.commit") to avoid collision with future commit concepts.
+//     on WorkBranchMetadataKey by the close gate. Also required by the
+//     pass-close contract: a close carrying OutcomeMetadataKey ("gc.outcome")
+//     = "pass" must name an existing, branch-reachable commit with a clean
+//     working tree. Named in the gc.work_* family (not a bare "gc.commit") to
+//     avoid collision with future commit concepts.
 //   - WorkVerificationMetadataKey ("gc.work_verification") — the verification
 //     record (gate result, "manual", or a link) backing a shipped outcome.
 //
-// The set of valid WorkOutcomeMetadataKey values and the "shipped requires a
-// commit on the branch" rule live with the close gate in cmd/gc.
+// The set of valid WorkOutcomeMetadataKey values, the "shipped requires a
+// commit on the branch" rule, and the pass-close contract live with the close
+// gate in cmd/gc.
 
 // FormulaVarPrefix is the dynamic key prefix under which formula-supplied
 // variables are written as gc.var.<name>. The suffix is open-world (a

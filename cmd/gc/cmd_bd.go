@@ -304,9 +304,12 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// Work-record close gate (ADR-0009): a close routed through the SDK seam
 	// must satisfy the typed work-record contract (gc.work_outcome present;
 	// shipped ⇒ gc.work_commit reachable on gc.work_branch). Warn-only by default;
-	// blocks the close only when GC_WORK_RECORD_ENFORCE is set. Reuses the
-	// store/beads the write-ID guard above already opened and read, and the
-	// config the caller already loaded.
+	// blocks the close only when GC_WORK_RECORD_ENFORCE is set. The pass-close
+	// contract (ga-dnay) rides the same gate and ALWAYS blocks: gc.outcome=pass
+	// requires an existing, branch-reachable gc.work_commit and a working tree
+	// clean of non-infrastructure changes. Reuses the store/beads the write-ID
+	// guard above already opened and read, and the config the caller already
+	// loaded.
 	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr) {
 		return 1
 	}
