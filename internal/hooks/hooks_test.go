@@ -165,6 +165,9 @@ func TestInstallClaude(t *testing.T) {
 	if !strings.Contains(s, `"awaySummaryEnabled": false`) {
 		t.Error("claude settings should disable awaySummaryEnabled to prevent idle stalls (gh-1962)")
 	}
+	if !strings.Contains(s, `"crossSessionInbound": "accept"`) {
+		t.Error("claude settings should set crossSessionInbound=accept explicitly: gc sessions run --dangerously-skip-permissions, so the permission-mode-derived default HOLDS peer messages from prompting-class senders behind an approval dialog no one watches, and dialogExpiry then silently drops them (ga-mgi8)")
+	}
 	if !strings.Contains(s, `$HOME/go/bin`) {
 		t.Error("claude hook commands should include PATH export")
 	}
@@ -1278,6 +1281,57 @@ func TestInstallClaudeMergesCityDotClaudeSettings(t *testing.T) {
 	// settings instead of current defaults.
 	if _, ok := fs.Files["/city/hooks/claude.json"]; ok {
 		t.Fatalf("hooks/claude.json should NOT be written when source is .claude/settings.json (stale-mirror risk)")
+	}
+}
+
+// TestInstallClaudeAddsCrossSessionInboundToExistingRuntimeSettings verifies
+// the upgrade path for cities installed before crossSessionInbound existed in
+// the embedded defaults: their .gc/settings.json (equal to the previous
+// embedded base) is treated as a legacy-runtime override and merged over the
+// current base, so the new key still lands on the next install pass.
+func TestInstallClaudeAddsCrossSessionInboundToExistingRuntimeSettings(t *testing.T) {
+	fs := fsys.NewFake()
+	current, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	old := strings.Replace(string(current), `"crossSessionInbound": "accept",`, ``, 1)
+	if old == string(current) {
+		t.Fatal("old-base fixture did not diverge from current embedded config — check crossSessionInbound line")
+	}
+	fs.Files["/city/.gc/settings.json"] = []byte(old)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	data := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(data, `"crossSessionInbound": "accept"`) {
+		t.Fatalf("reinstall over pre-crossSessionInbound runtime settings should add the key:\n%s", data)
+	}
+	if !strings.Contains(data, "SessionStart") {
+		t.Fatalf("runtime settings lost hooks during upgrade merge:\n%s", data)
+	}
+}
+
+// TestInstallClaudeCityOverrideCanRefuseCrossSessionInbound verifies the
+// operator escape hatch: a city-level .claude/settings.json that sets
+// crossSessionInbound wins over the embedded accept default in the merged
+// runtime settings, for lanes that must not take out-of-band instruction.
+func TestInstallClaudeCityOverrideCanRefuseCrossSessionInbound(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{"crossSessionInbound": "refuse"}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	data := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(data, `"crossSessionInbound": "refuse"`) {
+		t.Fatalf("city .claude/settings.json crossSessionInbound override should win over embedded accept:\n%s", data)
+	}
+	if strings.Contains(data, `"crossSessionInbound": "accept"`) {
+		t.Fatalf("embedded accept should be replaced, not duplicated, by the override:\n%s", data)
 	}
 }
 

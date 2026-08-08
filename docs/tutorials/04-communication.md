@@ -153,6 +153,27 @@ provider compacts its context. Those commands surface pending work, deliver
 mail, drain queued nudges, and save a handoff before a context cycle. Without
 them you'd run `gc mail check` and `gc prime` by hand on every agent.
 
+The managed settings make one more choice for Claude sessions: they set
+[`crossSessionInbound`](https://code.claude.com/docs/en/cross-session-messaging)
+to `accept`, so a message another Claude Code session sends to a Gas City agent
+is delivered. Claude Code's own default holds a message sent to a
+permission-bypassing session behind an approval dialog — an unattended agent
+never answers it, and the message is silently dropped when the dialog expires.
+Delivery grants no authority: Claude Code never lets an inbound peer message
+approve a permission or change configuration.
+
+To tighten this for agents that must not take out-of-band instruction, set
+`crossSessionInbound` to `"hold"` or `"refuse"` — in the city's
+`.claude/settings.json` to change the merged default for every agent, or in a
+rig repository's checked-in `.claude/settings.json` to pin one project (Claude
+Code lets project settings tighten this value, never loosen it).
+
+<Note>
+`refuse` is invisible. A refusing session looks identical in `/status` and in
+other sessions' listings — senders get no error, messages just never arrive. If
+you refuse a lane, record that where operators will look.
+</Note>
+
 ## What's next
 
 You've seen the two coordination mechanisms — mail for messages and slung beads

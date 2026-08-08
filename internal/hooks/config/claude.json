@@ -3,6 +3,7 @@
   "enableAllProjectMcpServers": true,
   "editorMode": "normal",
   "awaySummaryEnabled": false,
+  "crossSessionInbound": "accept",
   "hooks": {
     "SessionStart": [
       {

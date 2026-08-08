@@ -399,6 +399,21 @@ func ompHookVersion(content string) int {
 //
 // The selected source is merged over embedded defaults so new default hooks
 // still land for users with custom settings.
+//
+// The embedded defaults set crossSessionInbound=accept deliberately. gc
+// launches claude sessions with --dangerously-skip-permissions, and Claude
+// Code's permission-mode-derived inbound default makes a bypassing session
+// HOLD every peer message from a prompting-class sender behind an approval
+// dialog; unattended sessions never answer it, and dialogExpiry (default 5m)
+// then drops the message with only a sender-side notice. An explicit accept
+// in the --settings file makes delivery deterministic without granting
+// senders authority (Claude Code already forbids inbound peer messages from
+// approving permissions or changing configuration). Operators can tighten
+// this: a city-level .claude/settings.json crossSessionInbound value wins in
+// this merge, and a rig repo's checked-in project settings may set
+// hold/refuse, which beat an accept from --settings on Claude Code's own
+// strictness ladder. refuse is invisible — a refusing session looks identical
+// in /status and in peers' listings — so prefer hold where humans watch.
 func installClaude(fs fsys.FS, cityDir string) error {
 	hookDst := filepath.Join(cityDir, citylayout.ClaudeHookFile)
 	runtimeDst := filepath.Join(cityDir, ".gc", "settings.json")
