@@ -2350,6 +2350,81 @@ esac
 	}
 }
 
+// TestCmdHookRigScopedAgentQueriesRigStoreOnce guards the federated store list
+// against duplicate entries. A rig-scoped agent's own work-query env resolves
+// to the same rig coordinates as the rig entry the hook prepends
+// (rigScopedHookRig + appendOneRigHookStore), so without dedup the most
+// expensive store script ran twice per hook — half the multi-minute silent
+// claim sweeps in ga-50bu. The tier-3 open-status ephemeral probe runs exactly
+// once per store-script invocation (no session identity vars are set here, so
+// the assigned tiers skip), making its per-store call count equal to the
+// number of times that store's script ran.
+func TestCmdHookRigScopedAgentQueriesRigStoreOnce(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_TMUX_SESSION", "host-session")
+	cityDir := t.TempDir()
+	fakeBin := t.TempDir()
+	rigDir := filepath.Join(cityDir, "myrig")
+
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := fmt.Sprintf(`[workspace]
+name = "test-city"
+
+[[rigs]]
+name = "myrig"
+path = %q
+
+[[agent]]
+name = "worker"
+dir = "myrig"
+`, rigDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	callLog := filepath.Join(t.TempDir(), "bd-calls.log")
+	fakeBD := filepath.Join(fakeBin, "bd")
+	script := `#!/bin/sh
+printf '%s|%s\n' "$BEADS_DIR" "$*" >> "$BD_CALL_LOG"
+printf '[]'
+`
+	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+origPath)
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_DIR", rigDir)
+	t.Setenv("BD_CALL_LOG", callLog)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdHook([]string{"worker"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("cmdHook() = %d, want 1 (no work anywhere); stderr=%s", code, stderr.String())
+	}
+
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("reading bd call log: %v", err)
+	}
+	rigBeads := filepath.Join(rigDir, ".beads")
+	rigScriptRuns := 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, rigBeads+"|") && strings.Contains(line, "ephemeral=true AND status=open") {
+			rigScriptRuns++
+		}
+	}
+	if rigScriptRuns != 1 {
+		t.Fatalf("rig-store work query ran %d times in one hook, want exactly 1 (duplicate federated entries must be deduped); log:\n%s", rigScriptRuns, raw)
+	}
+}
+
 // TestCmdHookResolvesRelativeRigPath guards the relative-rig-path handling:
 // when `[[rigs]].path` is relative (e.g. "myrig-repo"), cmdHook must
 // normalize it to an absolute path before building the rig env, or

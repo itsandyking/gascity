@@ -1932,6 +1932,98 @@ esac
 	}
 }
 
+// countingBdScript is a fake bd that logs every invocation's arguments to
+// $BD_CALL_LOG (one line per call) so tests can assert how many times each
+// probe ran, and answers every command with an empty result.
+const countingBdScript = `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_CALL_LOG"
+printf '[]'
+`
+
+// countEphemeralScans reads a countingBdScript call log and returns how many
+// unbounded ephemeral `bd query` scans ran per status predicate.
+func countEphemeralScans(t *testing.T, callLog string) (inProgress, open int) {
+	t.Helper()
+	raw, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("reading bd call log: %v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		switch {
+		case strings.Contains(line, "ephemeral=true AND status=in_progress"):
+			inProgress++
+		case strings.Contains(line, "ephemeral=true AND status=open"):
+			open++
+		}
+	}
+	return inProgress, open
+}
+
+func TestEffectiveWorkQueryRunsEachEphemeralScanOnce(t *testing.T) {
+	// Each ephemeral probe is an unbounded `bd query` table scan whose bd
+	// invocation is identity-independent — only the jq filter behind it uses the
+	// loop's $id. Re-running the identical scan per identity (3× in_progress,
+	// 3+1× open) multiplied the dominant cost of the claim-path work query on
+	// remote stores (ga-50bu: ~3s per scan against a server-mode store put the
+	// full query past the 60s hook timeout). The scans must be memoized: at most
+	// one per status predicate per work-query invocation.
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	callLog := filepath.Join(t.TempDir(), "bd-calls.log")
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"BD_CALL_LOG":     callLog,
+		"GC_SESSION_ID":   "mc-test",
+		"GC_SESSION_NAME": "gc__worker-mc-test",
+		"GC_ALIAS":        "hello-world/worker-1",
+	}, countingBdScript)
+	if strings.TrimSpace(out) != "[]" {
+		t.Fatalf("EffectiveWorkQuery() with no work = %q, want []", out)
+	}
+	inProgress, open := countEphemeralScans(t, callLog)
+	if inProgress > 1 {
+		t.Errorf("ephemeral in_progress scan ran %d times in one work query, want at most 1", inProgress)
+	}
+	if open > 1 {
+		t.Errorf("ephemeral open scan ran %d times in one work query, want at most 1", open)
+	}
+}
+
+func TestEffectiveWorkQueryEphemeralScanCacheServesLaterIdentities(t *testing.T) {
+	// The memoized scan runs during the FIRST identity's probe; later identities
+	// must match against the cached result, not a re-scan. The wisp here is
+	// assigned to the third identity ($GC_ALIAS), so surfacing it proves the
+	// cache is read back correctly, and the call counts prove the scan ran once
+	// and the open-status scan (a later tier) never ran at all.
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	callLog := filepath.Join(t.TempDir(), "bd-calls.log")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_CALL_LOG"
+case "$*" in
+  *"ephemeral=true AND status=in_progress"*)
+    printf '[{"id":"ga-cached-wisp","assignee":"hello-world/worker-1","status":"in_progress","ephemeral":true}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"BD_CALL_LOG":     callLog,
+		"GC_SESSION_ID":   "mc-test",
+		"GC_SESSION_NAME": "gc__worker-mc-test",
+		"GC_ALIAS":        "hello-world/worker-1",
+	}, bdScript)
+	if !strings.Contains(out, "ga-cached-wisp") {
+		t.Fatalf("EffectiveWorkQuery() = %q, want cached ephemeral wisp surfaced for the third identity", out)
+	}
+	inProgress, open := countEphemeralScans(t, callLog)
+	if inProgress != 1 {
+		t.Errorf("ephemeral in_progress scan ran %d times, want exactly 1", inProgress)
+	}
+	if open != 0 {
+		t.Errorf("ephemeral open scan ran %d times, want 0 (tier 1 exits before any open-status tier)", open)
+	}
+}
+
 func TestEffectiveWorkQueryCustom(t *testing.T) {
 	a := Agent{Name: "mayor", WorkQuery: "bd ready --label=pool:polecats"}
 	got := a.EffectiveWorkQuery()

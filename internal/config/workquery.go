@@ -96,6 +96,25 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
 }
 
+// ephemeralScanPreludeScript defines the lazily-memoized ephemeral scans every
+// probe tier reads. Each unbounded `bd query` ephemeral scan is
+// identity-independent — only the jq filter behind it varies per identity — yet
+// the probe tiers used to re-run the identical scan inside their per-identity
+// loops (3× in_progress + up to 4× open per work query). Against a server-mode
+// store each scan is a multi-second remote table scan, and that repetition put
+// the whole work query past the hook timeout on loaded stores (ga-50bu). The
+// fetch helpers run each scan at most once per script invocation and cache the
+// result in a shell variable; a probe calls the fetcher in the parent shell,
+// then filters the cached value. A fetch failure caches as empty for the rest
+// of this invocation — the next hook tick rescans.
+//
+// Redefinition is harmless, so every tier-script builder emits this prelude and
+// any composition of tiers stays self-contained.
+func ephemeralScanPreludeScript() string {
+	return `gc_eph_fetch_inprog() { [ -n "${gc_eph_inprog_set:-}" ] || { gc_eph_inprog=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + `); gc_eph_inprog_set=1; }; }; ` +
+		`gc_eph_fetch_open() { [ -n "${gc_eph_open_set:-}" ] || { gc_eph_open=$(` + bdQueryEphemeralStatusQuietShell("open") + `); gc_eph_open_set=1; }; }; `
+}
+
 func legacyEphemeralReadyFilterJQ(selector string, limit int, excludeHoldLabels bool) string {
 	body := selector +
 		` | select(((.issue_type // .type // "") != "epic"))` +
@@ -122,15 +141,15 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 		limit,
 		true,
 	)
-	query := bdQueryEphemeralStatusShell("open")
 	if quiet {
-		query = bdQueryEphemeralStatusQuietShell("open")
+		// The quiet form runs on the worker probe path, where the assigned
+		// tiers may already have fetched the open-status scan: read the
+		// memoized value instead of re-scanning. Callers embed this inside a
+		// command substitution, so a fetch that happens here still runs the
+		// scan at most once per probe.
+		return `{ gc_eph_fetch_open; printf "%s" "$gc_eph_open" | jq --arg target "$target" ` + shellquote.Quote(filter) + ` 2>/dev/null; } || printf "[]"`
 	}
-	jqStderr := ""
-	if quiet {
-		jqStderr = ` 2>/dev/null`
-	}
-	return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + jqStderr + `; } || printf "[]"`
+	return `{ ` + bdQueryEphemeralStatusShell("open") + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + `; } || printf "[]"`
 }
 
 // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
@@ -138,7 +157,8 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 // prints it, and exits 0. The caller appends a terminal fallthrough
 // (printf "[]") for the empty case.
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
-	return `probe_pool_demand() { ` +
+	return ephemeralScanPreludeScript() +
+		`probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
@@ -198,7 +218,8 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 }
 
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
-	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return ephemeralScanPreludeScript() +
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
@@ -265,7 +286,8 @@ func inProgressBlockedByEnrichmentScript(shellVar string) string {
 }
 
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
-	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return ephemeralScanPreludeScript() +
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
@@ -279,7 +301,8 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 }
 
 func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
-	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return ephemeralScanPreludeScript() +
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
@@ -294,7 +317,8 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 }
 
 func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
-	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return ephemeralScanPreludeScript() +
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
@@ -308,7 +332,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
+	return `gc_eph_fetch_inprog; r=$(printf "%s" "$gc_eph_inprog" | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
@@ -318,7 +342,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 		return ""
 	}
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
+	return `gc_eph_fetch_open; r=$(printf "%s" "$gc_eph_open" | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }

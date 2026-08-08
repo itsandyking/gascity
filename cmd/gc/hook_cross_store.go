@@ -144,6 +144,31 @@ func rigScopedHookRig(cfg *config.City, agentIdentity string) string {
 	return ""
 }
 
+// dedupeHookStores returns stores with byte-identical duplicate entries
+// removed, keeping the first occurrence in place. A rig-scoped agent's own
+// work-query env resolves to the same rig coordinates as the rig entry the
+// hook prepends (both are built from the same agent view through the same
+// deterministic env machinery), so without dedup the most expensive store
+// script ran twice on every hook tick (ga-50bu). Only exact (dir, env)
+// matches collapse — a near-miss is kept, which costs a redundant query but
+// never drops a genuinely distinct store.
+func dedupeHookStores(stores []hookStore) []hookStore {
+	out := make([]hookStore, 0, len(stores))
+	for _, s := range stores {
+		dup := false
+		for _, kept := range out {
+			if sameHookStore(kept, s) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // firstStoreWithWork runs command against each store in order and returns the
 // output and store of the FIRST store that reports ready work (applying the same
 // normalize + unready-filter that doHook uses, so a store with only

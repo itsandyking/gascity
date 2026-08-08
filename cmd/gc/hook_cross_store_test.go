@@ -67,6 +67,39 @@ func TestAppendOneRigHookStoreSkipsUnknownInput(t *testing.T) {
 	}
 }
 
+func TestDedupeHookStoresCollapsesIdenticalEntries(t *testing.T) {
+	rig := hookStore{dir: "/rigs/foo", env: []string{"A=1", "B=2"}}
+	rigDup := hookStore{dir: "/rigs/foo", env: []string{"A=1", "B=2"}}
+	city := hookStore{dir: "/city", env: []string{"A=1"}}
+	got := dedupeHookStores([]hookStore{rig, rigDup, city})
+	if len(got) != 2 {
+		t.Fatalf("dedupeHookStores() kept %d stores, want 2", len(got))
+	}
+	if !sameHookStore(got[0], rig) {
+		t.Errorf("dedupeHookStores()[0] = %+v, want the first rig entry preserved in place", got[0])
+	}
+	if !sameHookStore(got[1], city) {
+		t.Errorf("dedupeHookStores()[1] = %+v, want the city entry", got[1])
+	}
+}
+
+func TestDedupeHookStoresKeepsDistinctEntries(t *testing.T) {
+	stores := []hookStore{
+		{dir: "/a", env: []string{"K=1"}},
+		{dir: "/a", env: []string{"K=2"}},
+		{dir: "/b", env: []string{"K=1"}},
+	}
+	got := dedupeHookStores(stores)
+	if len(got) != 3 {
+		t.Fatalf("dedupeHookStores() kept %d stores, want all 3 distinct entries", len(got))
+	}
+	for i := range stores {
+		if !sameHookStore(got[i], stores[i]) {
+			t.Errorf("dedupeHookStores()[%d] = %+v, want %+v (order preserved)", i, got[i], stores[i])
+		}
+	}
+}
+
 func TestFirstStoreWithWorkReturnsFirstStoreThatHasWork(t *testing.T) {
 	stores := []hookStore{{dir: "city"}, {dir: "riga"}, {dir: "rigb"}}
 	var calls []string

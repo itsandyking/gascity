@@ -422,6 +422,11 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		// appendCityHookStore.
 		stores = appendCityHookStore(stores, cityPath, cfg, &a, overrides)
 	}
+	// The rig-scoped path above prepends a rig entry that resolves identically
+	// to the agent's own env entry; collapse duplicates so no store's work
+	// query runs twice per hook. Keeping the first occurrence preserves the
+	// primary (emit-on-timeout) store at index 0.
+	stores = dedupeHookStores(stores)
 
 	// emitQueryFailure surfaces a killed/timed-out work query on the event bus
 	// so the reconciler can escalate instead of silently treating the strand as
