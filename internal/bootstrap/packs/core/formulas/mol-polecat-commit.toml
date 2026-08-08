@@ -1,27 +1,39 @@
 description = """
 Polecat direct-commit variant — commits directly to base_branch.
 
-Extends mol-polecat-base with a simplified workspace setup (worktree on
-base_branch, no feature branch) and direct commit+push instead of refinery
-submission. Designed for small installations where merge review is
-unnecessary.
+Extends mol-polecat-base with a simplified workspace setup (isolated
+worktree on base_branch, no feature branch) and direct commit+push instead
+of refinery submission. Designed for small installations where merge review
+is unnecessary; installations that require review set
+`require_review_verdict = "true"` (rig `formula_vars` or pour-time var) and
+the push step then refuses to push until a passing review verdict covering
+HEAD is recorded on the work bead.
 
 ## Polecat Contract (Direct-Commit Model)
 
 1. Receive work (molecule poured with this formula, assigned to you)
 2. Follow steps in order (read descriptions, execute, move to next)
-3. Commit to base_branch, push, close bead, exit
+3. Evaluate the push gate; when open: commit to base_branch, push, close
+   bead, exit. When closed: halt at branch-ready with your commits anchored
+   at `work/<bead-id>` — never push around a closed gate.
 4. You are GONE — no refinery step needed
 
 **No feature branch.** Work is committed directly to base_branch.
 Push conflicts are handled by fetch + rebase + retry (up to 3 times).
+
+**Isolation is a hard rule.** Every step runs inside a worktree this
+formula created and recorded on the work bead. Never adopt a checkout you
+find lying around — not the rig root, not a mayor/landing worktree, not
+another agent's worktree — even if it is already on {{base_branch}}.
 
 ## Failure Modes
 
 | Situation | Action |
 |-----------|--------|
 | Tests fail | Fix them. Do not proceed with failures. |
-| Push conflict (3 retries exhausted) | Mail Witness, mark yourself stuck |
+| Push gate closed | Halt at branch-ready: anchor `work/<bead-id>`, park this step, notify Witness. NEVER push. |
+| Push conflict (3 retries exhausted) | Anchor `work/<bead-id>`, mail Witness, mark yourself stuck |
+| Worktree ownership check fails | Mail Witness and stop. Do not work where you are. |
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
 | Unsure what to do | Mail Witness, don't guess |"""
@@ -31,20 +43,33 @@ extends = ["mol-polecat-base"]
 [requires]
 formula_compiler = ">=2.0.0"
 
+[vars]
+[vars.require_review_verdict]
+description = "When \"true\", the push step only pushes if the work bead carries a passing review verdict (gc.review_verdict = pass|pass_with_findings) whose gc.reviewed_commit equals the HEAD being pushed; otherwise it halts at branch-ready. From rig `formula_vars` or pour-time vars. Default \"false\" preserves the review-free direct-commit behavior."
+default = "false"
+
 [[steps]]
 id = "workspace-setup"
-title = "Set up worktree on base branch"
+title = "Set up an isolated worktree on base branch"
 needs = ["load-context"]
 description = """
-Create an isolated worktree checked out at base_branch HEAD.
-No feature branch — you will commit directly.
+Create (or validate and resume) an isolated worktree checked out at
+base_branch HEAD. No feature branch — the terminal step commits directly.
 
 **Config: base_branch = {{base_branch}}**
 **Config: setup_command = {{setup_command}}**
 
-**1. Fetch latest and derive your work bead:**
+**OWNERSHIP RULE (hard):** you may only work inside a worktree this step
+created for this work bead and recorded on the bead. NEVER adopt a checkout
+you did not create — not the rig root, not a mayor/landing worktree, not
+another agent's worktree, not any pre-existing checkout of {{base_branch}} —
+even if one is conveniently present and on the right branch. If validation
+below fails, create a fresh worktree; if you cannot, mail Witness and stop.
+
+**1. Fetch latest and derive your work bead (run from the rig checkout):**
 ```bash
 git fetch --prune origin
+RIG_ROOT=$(pwd)
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
 if [ -z "$WORK_BEAD_ID" ]; then
@@ -53,57 +78,120 @@ if [ -z "$WORK_BEAD_ID" ]; then
 fi
 ```
 
-**2. Ensure worktree exists.**
+**2. Resume check — reuse ONLY a recorded worktree that passes validation.**
 
-Check if `metadata.work_dir` already records your worktree path:
+A prior attempt may have recorded its worktree on the bead:
 ```bash
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+RECORDED=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.work_dir"] // .[0].metadata.work_dir // empty')
 ```
 
-**If worktree path exists in metadata** — reuse it:
-```bash
-cd "$WORKTREE"              # Enter existing worktree
-git pull --rebase origin {{base_branch}}  # Catch up to latest
-```
-If the directory is missing, fall through to create a new one.
+Reuse it only if EVERY check passes (it exists, it is named for this bead,
+and it is a linked worktree of THIS repository). Anything else — including
+a path that exists but fails a check — falls through to step 3 to create a
+fresh worktree. Never enter, repair, or delete a path that fails
+validation; it is not yours.
 
-**If no worktree** — create one:
 ```bash
-WORKTREE_PATH=$(pwd)/worktrees/"$WORK_BEAD_ID"
-git worktree add "$WORKTREE_PATH" --detach origin/{{base_branch}}
-cd "$WORKTREE_PATH"
-```
-Record immediately so restarts and witness recovery can find it:
-```bash
-gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
+WORKTREE=""
+if [ -n "$RECORDED" ] && [ -d "$RECORDED" ]; then
+  case "$(basename "$RECORDED")" in
+    "$WORK_BEAD_ID"|"$WORK_BEAD_ID".*)
+      if [ "$(git -C "$RECORDED" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ] \
+         && [ "$(git -C "$RECORDED" rev-parse --path-format=absolute --git-dir)" != "$(git -C "$RECORDED" rev-parse --path-format=absolute --git-common-dir)" ]; then
+        WORKTREE="$RECORDED"
+      fi
+      ;;
+  esac
+fi
+if [ -n "$WORKTREE" ]; then
+  cd "$WORKTREE"
+  git fetch origin
+  git rebase origin/{{base_branch}}
+fi
 ```
 
-**3. Ensure clean working state:**
+**3. Otherwise create a fresh worktree** (always `git worktree add`; never
+reuse an unvalidated directory):
 ```bash
-git status                  # Should be clean
+if [ -z "$WORKTREE" ]; then
+  WORKTREE="$RIG_ROOT/worktrees/$WORK_BEAD_ID"
+  [ -e "$WORKTREE" ] && WORKTREE="$RIG_ROOT/worktrees/$WORK_BEAD_ID.$(date +%s)"
+  git worktree add "$WORKTREE" --detach origin/{{base_branch}}
+  cd "$WORKTREE"
+fi
+```
+Record it immediately so restarts, witness recovery, and the close gate can
+find it (`gc.work_dir` is the canonical key; `work_dir` is kept for older
+readers):
+```bash
+gc bd update "$WORK_BEAD_ID" \\
+  --set-metadata gc.work_dir="$WORKTREE" \\
+  --set-metadata work_dir="$WORKTREE"
 ```
 
-**4. Run project setup (if configured):**
+**4. Prove you are in an owned, isolated worktree before doing anything else:**
+```bash
+[ "$(git rev-parse --path-format=absolute --git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ] \\
+  || { echo "refusing: $(pwd) is not a linked worktree" >&2; exit 1; }
+case "$(basename "$PWD")" in
+  "$WORK_BEAD_ID"|"$WORK_BEAD_ID".*) ;;
+  *) echo "refusing: $(pwd) was not created by this formula for $WORK_BEAD_ID" >&2; exit 1 ;;
+esac
+git status --porcelain      # must be empty
+```
+If any check fails: do NOT proceed and do NOT work from wherever you are.
+Mail Witness with the failing path and stop.
+
+**5. Run project setup (if configured):**
 ```bash
 {{setup_command}}
 ```
 Empty setup_command → skip.
 
-**Exit criteria:** In your worktree, at base_branch HEAD, deps installed,
-worktree recorded on the bead."""
+**Exit criteria:** In an isolated worktree this step created (or validated),
+at origin/{{base_branch}}, deps installed, worktree recorded on the bead
+under `gc.work_dir`."""
 
 [[steps]]
 id = "commit-and-push"
-title = "Commit to base branch, push, and exit"
+title = "Evaluate push gate; push to base branch or halt at branch-ready"
 needs = ["self-review"]
 description = """
-Commit your work directly to base_branch and push. You cease to exist
-after this step.
+Push your work directly to base_branch — or, when the push gate is closed,
+halt at branch-ready with your commits anchored to a ref. You cease to
+exist after this step either way.
 
-**1. Derive your work bead and verify clean state (safeguard):**
+**Config: base_branch = {{base_branch}}**
+**Config: require_review_verdict = {{require_review_verdict}}**
+
+**1. Derive your work bead, enter the recorded worktree, and re-prove
+ownership (safeguard):**
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+RECORDED=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata["gc.work_dir"] // .[0].metadata.work_dir // empty')
+if [ -z "$RECORDED" ] || [ ! -d "$RECORDED" ]; then
+  echo "refusing: no recorded worktree for $WORK_BEAD_ID (workspace-setup owns creation)" >&2
+  exit 1
+fi
+case "$(basename "$RECORDED")" in
+  "$WORK_BEAD_ID"|"$WORK_BEAD_ID".*) ;;
+  *) echo "refusing: $RECORDED was not created by this formula for $WORK_BEAD_ID" >&2; exit 1 ;;
+esac
+cd "$RECORDED"
+[ "$(git rev-parse --path-format=absolute --git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ] \\
+  || { echo "refusing: $RECORDED is not a linked worktree" >&2; exit 1; }
+```
+This guard is why a formula bug cannot commit into the rig root or a
+mayor's landing worktree: work happens only in the worktree recorded on
+the bead, and only when it passes the same ownership checks
+workspace-setup enforces. A resumed session lands here correctly (it cds
+into the recorded worktree); an unowned or missing path refuses. If it
+refuses: mail Witness and exit — do not "fix" it by committing from
+wherever you are.
+
+**2. Capture stragglers:**
+```bash
 git status --porcelain
 ```
 If ANY output (untracked files, uncommitted changes):
@@ -111,7 +199,66 @@ If ANY output (untracked files, uncommitted changes):
 git add -A && git commit -m "chore: capture remaining work ($WORK_BEAD_ID)"
 ```
 
-**2. Push to base_branch with conflict retry (up to 3 attempts):**
+**3. Evaluate the push gate (MANDATORY — never push around it):**
+```bash
+HEAD_COMMIT=$(git rev-parse HEAD)
+WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json)
+HOLDS=$(printf '%s' "$WORK_JSON" | jq -r '[(.[0].labels // [])[] | select(startswith("hold:"))] | join(",")')
+REVIEW_VERDICT=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.review_verdict"] // empty')
+REVIEWED_COMMIT=$(printf '%s' "$WORK_JSON" | jq -r '.[0].metadata["gc.reviewed_commit"] // empty')
+
+PUSH_BLOCKED=""
+if [ -n "$HOLDS" ]; then
+  PUSH_BLOCKED="work bead is on hold ($HOLDS)"
+elif [ "{{require_review_verdict}}" = "true" ]; then
+  case "$REVIEW_VERDICT" in
+    pass|pass_with_findings)
+      if [ "$REVIEWED_COMMIT" != "$HEAD_COMMIT" ]; then
+        PUSH_BLOCKED="review verdict covers ${REVIEWED_COMMIT:-<unset>} but HEAD is $HEAD_COMMIT (stale verdict)"
+      fi
+      ;;
+    *)
+      PUSH_BLOCKED="no passing review verdict on the work bead (gc.review_verdict=\\"$REVIEW_VERDICT\\")"
+      ;;
+  esac
+fi
+```
+
+The gate is open only when `PUSH_BLOCKED` is empty: no `hold:*` label on
+the work bead, and — when review is required — a passing durable verdict
+(`gc.review_verdict` = `pass` or `pass_with_findings`, stamped by the
+review workflow or the mayor) whose `gc.reviewed_commit` equals the HEAD
+you are about to push. A verdict for a different commit is stale: changes
+made after review never ride an old verdict.
+
+**4. If the gate is CLOSED — halt at branch-ready. Do NOT push.**
+
+Anchor FIRST: a detached-HEAD worktree with zero refs orphans its commits
+the moment the worktree is pruned. Then bookkeep, park this step, notify,
+and exit.
+
+```bash
+git branch -f "work/$WORK_BEAD_ID" HEAD
+gc bd update "$WORK_BEAD_ID" \\
+  --set-metadata gc.work_commit="$HEAD_COMMIT" \\
+  --set-metadata gc.work_branch="work/$WORK_BEAD_ID" \\
+  --notes "Branch-ready halt: $PUSH_BLOCKED. Commits anchored at work/$WORK_BEAD_ID ($HEAD_COMMIT); worktree preserved at $(pwd)."
+STEP_BEAD_ID="${GC_BEAD_ID:-$CLAIMED_BEAD_ID}"   # the bead you claimed for THIS step
+gc bd set-state "$STEP_BEAD_ID" hold=mayor \\
+  --reason "push gate closed: $PUSH_BLOCKED; work anchored at work/$WORK_BEAD_ID"
+gc bd update "$STEP_BEAD_ID" --status blocked
+gc mail send <rig>/witness -s "HALT: branch-ready, push gate closed" \\
+  -m "Issue: $WORK_BEAD_ID. $PUSH_BLOCKED. Anchored: work/$WORK_BEAD_ID @ $HEAD_COMMIT. Worktree: $(pwd). Resume: stamp gc.review_verdict + gc.reviewed_commit=$HEAD_COMMIT on $WORK_BEAD_ID (or clear the work-bead hold), then 'gc bd label remove $STEP_BEAD_ID hold:mayor' and 'gc bd update $STEP_BEAD_ID --status open' to let this step re-fire."
+gc runtime drain-ack
+exit 0
+```
+
+Do NOT clean up the worktree, do NOT close the work bead, and NEVER push
+"just this once" — a closed gate is the halt contract working. When an
+actor opens the gate (stamps the verdict / clears the hold and reopens this
+step), this step re-fires and takes the push path below.
+
+**5. If the gate is OPEN — push with conflict retry (up to 3 attempts):**
 
 ```bash
 for attempt in 1 2 3; do
@@ -121,8 +268,13 @@ for attempt in 1 2 3; do
     fi
     if [ "$attempt" -eq 3 ]; then
         echo "Push failed after 3 attempts"
-        gc mail send <rig>/witness -s "HELP: Push conflict after 3 retries" \
-          -m "Issue: $WORK_BEAD_ID. Cannot push to {{base_branch}}."
+        git branch -f "work/$WORK_BEAD_ID" HEAD
+        gc bd update "$WORK_BEAD_ID" \\
+          --set-metadata gc.work_commit="$(git rev-parse HEAD)" \\
+          --set-metadata gc.work_branch="work/$WORK_BEAD_ID" \\
+          --notes "Push conflict after 3 retries. Commits anchored at work/$WORK_BEAD_ID."
+        gc mail send <rig>/witness -s "HELP: Push conflict after 3 retries" \\
+          -m "Issue: $WORK_BEAD_ID. Cannot push to {{base_branch}}. Work anchored at work/$WORK_BEAD_ID. Worktree: $(pwd)."
         gc runtime drain-ack
         exit 1
     fi
@@ -131,23 +283,29 @@ for attempt in 1 2 3; do
     git rebase origin/{{base_branch}}
     # If rebase conflicts: resolve them, then git rebase --continue
 done
+HEAD_COMMIT=$(git rev-parse HEAD)    # rebase may have moved HEAD
 ```
 
-**3. Clean up worktree:**
+**6. Clean up worktree (pushed path only):**
 ```bash
+git branch -D "work/$WORK_BEAD_ID" 2>/dev/null || true   # anchor no longer needed; commits are on origin/{{base_branch}}
 WORKTREE_PATH=$(pwd)
 cd ..
 git worktree remove "$WORKTREE_PATH" --force
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
+gc bd update "$WORK_BEAD_ID" --unset-metadata gc.work_dir --unset-metadata work_dir
 ```
 
-**4. Close the bead:**
+**7. Close the work bead with its typed work record:**
 ```bash
-gc bd update "$WORK_BEAD_ID" --notes "Committed directly to {{base_branch}}: <brief summary>"
+gc bd update "$WORK_BEAD_ID" \\
+  --set-metadata gc.work_outcome=shipped \\
+  --set-metadata gc.work_commit="$HEAD_COMMIT" \\
+  --set-metadata gc.work_branch="origin/{{base_branch}}" \\
+  --notes "Committed directly to {{base_branch}}: <brief summary>"
 gc bd close "$WORK_BEAD_ID"
 ```
 
-**5. Signal reconciler and exit.**
+**8. Signal reconciler and exit.**
 ```bash
 gc runtime drain-ack
 exit
@@ -157,5 +315,8 @@ exit
 reconciler only restarts you if the pool check command finds more work.
 You are GONE. Done means gone. There is no idle state.
 
-**Exit criteria:** Changes pushed to {{base_branch}}, worktree cleaned up,
-bead closed, session exited."""
+**Exit criteria (pushed):** Changes pushed to {{base_branch}}, worktree
+cleaned up, bead closed with its work record, session exited.
+**Exit criteria (halted):** Commits anchored at work/<bead-id>, work bead
+stamped with gc.work_commit/gc.work_branch, this step parked on hold:mayor,
+Witness notified, session exited without pushing."""
