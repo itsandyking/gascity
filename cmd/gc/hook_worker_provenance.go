@@ -41,21 +41,17 @@ var builtinFamilyGenus = map[string]string{
 
 // providerGenus derives the model-lineage genus for a provider name: the
 // builtin family's lineage when the family is single-lineage, else the family
-// name, else the provider name itself (a fully custom standalone provider
-// still gets a stable, distinct genus label). Empty in ⇒ empty out.
+// name for router builtins. When no builtin family can be established — a
+// standalone custom provider, an unknown name, or an unresolvable base chain
+// — the genus is empty and stays unstamped (ga-4ttx): a provider label is a
+// launch-selection fact, not model-training lineage, and stamping it would
+// let cross-genus enforcement trust a fabricated value.
 func providerGenus(providerName string, cityProviders map[string]config.ProviderSpec) string {
-	providerName = strings.TrimSpace(providerName)
-	if providerName == "" {
-		return ""
-	}
-	family := config.BuiltinFamily(providerName, cityProviders)
+	family := config.BuiltinFamily(strings.TrimSpace(providerName), cityProviders)
 	if genus, ok := builtinFamilyGenus[family]; ok {
 		return genus
 	}
-	if family != "" {
-		return family
-	}
-	return providerName
+	return family
 }
 
 // hookWorkerProvenance resolves the claiming session's execution provenance
@@ -67,9 +63,9 @@ func providerGenus(providerName string, cityProviders map[string]config.Provider
 // resolved EffectiveDefaults (schema defaults + provider/agent option_defaults
 // + choices inferred from pinned provider args), overridden by any schema
 // choice explicitly present in the session's stored launch command — the
-// launch ground truth, which carries per-dispatch overrides. Best-effort: an
-// unresolvable provider still yields a genus from the name so the cross-genus
-// record survives.
+// launch ground truth, which carries per-dispatch overrides. A provider with
+// no established builtin lineage yields no genus — unknown lineage is
+// omitted, never guessed from the provider name (ga-4ttx).
 func hookWorkerProvenance(cfg *config.City, agent *config.Agent, info *session.Info, env []string) workerProvenance {
 	if cfg == nil || agent == nil {
 		return workerProvenance{}

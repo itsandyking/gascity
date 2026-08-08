@@ -35,6 +35,9 @@ func provenanceTestConfig() *config.City {
 				Base:    strPtr(""),
 				Command: "my-llm",
 			},
+			"broken-chain": {
+				Base: strPtr("provider:missing-parent"),
+			},
 		},
 	}
 }
@@ -42,8 +45,11 @@ func provenanceTestConfig() *config.City {
 // TestProviderGenus pins the provider-name → genus derivation: single-lineage
 // builtin families map to their model lineage, wrapped custom providers
 // resolve through their base chain, multi-model router families fall back to
-// the family name, and a fully custom standalone provider falls back to its
-// own name (still a stable, distinct genus label for cross-genus comparison).
+// the family name, and a provider with no established builtin lineage — a
+// standalone custom provider, an unknown name, or an unresolvable base chain
+// — yields no genus at all (ga-4ttx): a provider label is not model-training
+// lineage, and stamping it would let cross-genus enforcement trust a
+// fabricated value.
 func TestProviderGenus(t *testing.T) {
 	cfg := provenanceTestConfig()
 	tests := []struct {
@@ -59,7 +65,9 @@ func TestProviderGenus(t *testing.T) {
 		{"fable", "anthropic"},      // wrapped claude
 		{"luna", "openai"},          // wrapped codex
 		{"local-gemma", "opencode"}, // router family: falls back to family name
-		{"bespoke", "bespoke"},      // standalone custom: falls back to provider name
+		{"bespoke", ""},             // standalone custom: no lineage, genus omitted
+		{"vanished", ""},            // unknown name: no lineage, genus omitted
+		{"broken-chain", ""},        // unresolvable base chain: no lineage, genus omitted
 		{"", ""},
 	}
 	for _, tc := range tests {
@@ -194,18 +202,18 @@ func TestHookWorkerProvenanceNoProviderAnywhere(t *testing.T) {
 	}
 }
 
-// TestHookWorkerProvenanceUnresolvableProviderStillYieldsGenus: a provider
-// name that cannot resolve to a spec (an unknown name, say after a config
-// edit) still yields a genus label from the name itself so the cross-genus
-// record survives, with model/effort empty.
-func TestHookWorkerProvenanceUnresolvableProviderStillYieldsGenus(t *testing.T) {
+// TestHookWorkerProvenanceNoLineageOmitsGenus: a provider with no established
+// builtin lineage — an unknown name (say after a config edit), a standalone
+// custom provider, or an unresolvable base chain — yields no genus, so the
+// caller stamps nothing (ga-4ttx). A provider label is a launch-selection
+// fact, not model-training lineage; guessing one would let cross-genus
+// enforcement accept a same-genus review.
+func TestHookWorkerProvenanceNoLineageOmitsGenus(t *testing.T) {
 	cfg := provenanceTestConfig()
-	agent := &config.Agent{Name: "worker", Provider: "vanished"}
-
-	got := hookWorkerProvenance(cfg, agent, nil, nil)
-
-	want := workerProvenance{Genus: "vanished"}
-	if got != want {
-		t.Fatalf("hookWorkerProvenance = %+v, want %+v", got, want)
+	for _, provider := range []string{"vanished", "bespoke", "broken-chain"} {
+		agent := &config.Agent{Name: "worker", Provider: provider}
+		if got := hookWorkerProvenance(cfg, agent, nil, nil); got != (workerProvenance{}) {
+			t.Errorf("hookWorkerProvenance(provider=%q) = %+v, want zero", provider, got)
+		}
 	}
 }
