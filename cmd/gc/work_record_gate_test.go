@@ -526,6 +526,57 @@ func TestValidatePassCloseOnClose(t *testing.T) {
 			wantViols: []string{"internal/foo.go"},
 		},
 		{
+			name: "no-op work outcome needs no commit",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+				beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeNoOp,
+			},
+			checks: func() passCloseChecks {
+				// Commit predicates fail so the test proves they are never
+				// consulted when a typed no-op close carries no commit.
+				c := failingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) { return nil, nil }
+				return c
+			}(),
+			wantViols: nil,
+		},
+		{
+			name: "no-op work outcome with dirty tracked tree is refused",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+				beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeNoOp,
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.dirtyPaths = func() ([]string, error) { return []string{"internal/foo.go"}, nil }
+				return c
+			}(),
+			wantViols: []string{"internal/foo.go"},
+		},
+		{
+			name: "no-op with a stamped commit still validates it",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+				beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeNoOp,
+				beadmeta.WorkCommitMetadataKey:  "deadbeef",
+			},
+			checks: func() passCloseChecks {
+				c := passingPassCloseChecks()
+				c.commitExists = func(string) bool { return false }
+				return c
+			}(),
+			wantViols: []string{"does not exist"},
+		},
+		{
+			name: "shipped work outcome still requires a commit",
+			meta: map[string]string{
+				beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+				beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeShipped,
+			},
+			checks:    passingPassCloseChecks(),
+			wantViols: []string{"requires " + beadmeta.WorkCommitMetadataKey},
+		},
+		{
 			name: "infrastructure-only dirt is clean",
 			meta: map[string]string{
 				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
@@ -607,6 +658,84 @@ func newPassCloseRepo(t *testing.T) (string, string) {
 	runGit(t, dir, "add", "artifact.txt")
 	runGit(t, dir, "commit", "-m", "test: land artifact")
 	return dir, strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
+}
+
+// TestGitDirtyWorkTreePaths pins the tracked-content contract of the dirty
+// scan: modifications to tracked files (worktree or index, including renames)
+// are dirt; untracked and gitignored paths are not. A real rig accumulates
+// hundreds of untracked runtime paths (.claude/, worktrees/, local backups —
+// ga-vx36) that are not evidence of an uncommitted diff.
+func TestGitDirtyWorkTreePaths(t *testing.T) {
+	t.Run("tracked modifications count, untracked and ignored do not", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("scratch/\n"), 0o644); err != nil {
+			t.Fatalf("write gitignore: %v", err)
+		}
+		runGit(t, repoDir, "add", ".gitignore")
+		runGit(t, repoDir, "commit", "-m", "test: ignore scratch")
+		// Tracked modification in the worktree.
+		if err := os.WriteFile(filepath.Join(repoDir, "artifact.txt"), []byte("modified\n"), 0o644); err != nil {
+			t.Fatalf("modify artifact: %v", err)
+		}
+		// Staged-but-uncommitted new file (tracked in the index).
+		if err := os.WriteFile(filepath.Join(repoDir, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
+			t.Fatalf("write staged: %v", err)
+		}
+		runGit(t, repoDir, "add", "staged.txt")
+		// Untracked file, untracked runtime directory, gitignored file.
+		if err := os.WriteFile(filepath.Join(repoDir, "stray.txt"), []byte("stray\n"), 0o644); err != nil {
+			t.Fatalf("write stray: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoDir, ".claude"), 0o755); err != nil {
+			t.Fatalf("mkdir .claude: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, ".claude", "settings.json"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write .claude settings: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoDir, "scratch"), 0o755); err != nil {
+			t.Fatalf("mkdir scratch: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, "scratch", "tmp.txt"), []byte("scratch\n"), 0o644); err != nil {
+			t.Fatalf("write scratch: %v", err)
+		}
+
+		paths, err := gitDirtyWorkTreePaths(repoDir)
+		if err != nil {
+			t.Fatalf("gitDirtyWorkTreePaths: %v", err)
+		}
+		got := make(map[string]bool, len(paths))
+		for _, p := range paths {
+			got[p] = true
+		}
+		for _, want := range []string{"artifact.txt", "staged.txt"} {
+			if !got[want] {
+				t.Errorf("tracked change %q missing from dirty paths %v", want, paths)
+			}
+		}
+		for _, exclude := range []string{"stray.txt", ".claude/", ".claude/settings.json", "scratch/", "scratch/tmp.txt"} {
+			if got[exclude] {
+				t.Errorf("untracked/ignored path %q reported as dirt in %v", exclude, paths)
+			}
+		}
+	})
+
+	t.Run("renames carry both sides", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		runGit(t, repoDir, "mv", "artifact.txt", "renamed.txt")
+		paths, err := gitDirtyWorkTreePaths(repoDir)
+		if err != nil {
+			t.Fatalf("gitDirtyWorkTreePaths: %v", err)
+		}
+		got := make(map[string]bool, len(paths))
+		for _, p := range paths {
+			got[p] = true
+		}
+		for _, want := range []string{"renamed.txt", "artifact.txt"} {
+			if !got[want] {
+				t.Errorf("rename side %q missing from dirty paths %v", want, paths)
+			}
+		}
+	})
 }
 
 // TestEvaluateWorkRecordCloseGatePassClose exercises the pass-close gate
@@ -695,10 +824,10 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 		}
 	})
 
-	t.Run("dirty tree is refused", func(t *testing.T) {
+	t.Run("modified tracked file is refused", func(t *testing.T) {
 		repoDir, commit := newPassCloseRepo(t)
-		if err := os.WriteFile(filepath.Join(repoDir, "wip.txt"), []byte("uncommitted\n"), 0o644); err != nil {
-			t.Fatalf("write wip: %v", err)
+		if err := os.WriteFile(filepath.Join(repoDir, "artifact.txt"), []byte("uncommitted edit\n"), 0o644); err != nil {
+			t.Fatalf("modify artifact: %v", err)
 		}
 		store := beads.NewMemStoreFrom(1, []beads.Bead{{
 			ID: "pc-dirty", Type: "task", Status: "in_progress",
@@ -711,8 +840,53 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-dirty"}, store, nil, repoDir, false, &stderr); !block {
 			t.Fatalf("dirty-tree pass close not blocked; stderr=%s", stderr.String())
 		}
-		if !strings.Contains(stderr.String(), "wip.txt") {
+		if !strings.Contains(stderr.String(), "artifact.txt") {
 			t.Fatalf("stderr %q does not name the dirty path", stderr.String())
+		}
+	})
+
+	t.Run("untracked files never block a pass close", func(t *testing.T) {
+		repoDir, commit := newPassCloseRepo(t)
+		// Ambient rig noise: stray files and runtime directories that are
+		// untracked but not gitignored (the Podcast-Updates shape, ga-vx36).
+		if err := os.WriteFile(filepath.Join(repoDir, "stray.txt"), []byte("stray\n"), 0o644); err != nil {
+			t.Fatalf("write stray: %v", err)
+		}
+		for _, dir := range []string{".claude", "worktrees/x", ".beads.local-backup"} {
+			if err := os.MkdirAll(filepath.Join(repoDir, dir), 0o755); err != nil {
+				t.Fatalf("mkdir %s: %v", dir, err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, dir, "f.txt"), []byte("runtime\n"), 0o644); err != nil {
+				t.Fatalf("write %s file: %v", dir, err)
+			}
+		}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-untracked", Type: "task", Status: "in_progress",
+			Metadata: map[string]string{
+				beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+				beadmeta.WorkCommitMetadataKey: commit,
+			},
+		}}, nil)
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-untracked"}, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("untracked-only dirt blocked the close; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic no-op close without commit is allowed", func(t *testing.T) {
+		repoDir, _ := newPassCloseRepo(t)
+		store := beads.NewMemStoreFrom(1, []beads.Bead{{
+			ID: "pc-noop", Type: "task", Status: "in_progress", Metadata: map[string]string{},
+		}}, nil)
+		args := []string{
+			"update", "pc-noop",
+			"--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass,
+			"--set-metadata", beadmeta.WorkOutcomeMetadataKey + "=" + beadmeta.WorkOutcomeNoOp,
+			"--status=closed",
+		}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); block {
+			t.Fatalf("typed no-op pass close blocked; stderr=%s", stderr.String())
 		}
 	})
 

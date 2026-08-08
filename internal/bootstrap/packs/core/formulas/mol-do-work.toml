@@ -117,10 +117,15 @@ Witness.
 
 If `GC_BEAD_ID` is set and is different from `$WORK_BEAD_ID`, close it too. This
 prevents `mol-do-work` wrapper beads from remaining ready after the real work
-is complete.
+is complete. Stamp `gc.work_commit` with the landed state so the pass-close
+gate can verify the close (the wrapper's work record lives on the target bead).
 ```bash
 if [ -n "${GC_BEAD_ID:-}" ] && [ "$GC_BEAD_ID" != "$WORK_BEAD_ID" ]; then
-  gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Target $WORK_BEAD_ID completed. Commit: ${COMMIT:-none}."
+  STEP_COMMIT="${COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}"
+  gc bd update "$GC_BEAD_ID" \
+    --set-metadata gc.outcome=pass \
+    --set-metadata gc.work_commit="$STEP_COMMIT" \
+    --status=closed --notes "Target $WORK_BEAD_ID completed. Commit: ${STEP_COMMIT:-none}."
 fi
 ```
 
@@ -150,3 +155,8 @@ gc runtime drain-ack
 ```
 
 Run exactly these commands and nothing else."""
+# gc.kind=cleanup marks this step as teardown bookkeeping, not a work unit:
+# it is routed to the worker like any step, but the work-record and
+# pass-close gates exempt kind-carrying beads, so closing it with
+# gc.outcome=pass demands no gc.work_commit (ga-vx36).
+metadata = { "gc.kind" = "cleanup" }

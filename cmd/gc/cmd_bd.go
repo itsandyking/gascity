@@ -306,10 +306,10 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// shipped ⇒ gc.work_commit reachable on gc.work_branch). Warn-only by default;
 	// blocks the close only when GC_WORK_RECORD_ENFORCE is set. The pass-close
 	// contract (ga-dnay) rides the same gate and ALWAYS blocks: gc.outcome=pass
-	// requires an existing, branch-reachable gc.work_commit and a working tree
-	// clean of non-infrastructure changes. Reuses the store/beads the write-ID
-	// guard above already opened and read, and the config the caller already
-	// loaded.
+	// requires an existing, branch-reachable gc.work_commit (except typed
+	// gc.work_outcome=no-op closes) and a working tree clean of tracked-file
+	// modifications (ga-vx36). Reuses the store/beads the write-ID guard above
+	// already opened and read, and the config the caller already loaded.
 	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr) {
 		return 1
 	}

@@ -29,10 +29,16 @@ import (
 // enforced, independent of GC_WORK_RECORD_ENFORCE: a close carrying the
 // control-plane gc.outcome=pass on a worker-claimable bead must name a
 // gc.work_commit that exists and is reachable from a branch, with the working
-// tree clean of non-infrastructure changes (.agents/.codex/.gc excluded).
-// Twice on 2026-08-07 a worker closed "pass" with its entire diff uncommitted
-// on a detached HEAD — work that existed nowhere in git history and died with
-// the checkout. "pass" must mean the work landed.
+// tree clean of tracked-file modifications (untracked and gitignored paths
+// never count — real rigs accumulate hundreds of untracked runtime files —
+// and .agents/.codex/.gc are excluded even when tracked; ga-vx36). A close
+// whose typed work record says gc.work_outcome=no-op is exempt from the
+// commit requirement — that vocabulary means "no change was needed", so no
+// commit exists by contract — but still requires the clean tree: a "no-op"
+// with modified tracked files is exactly the uncommitted-diff lie the gate
+// exists to catch. Twice on 2026-08-07 a worker closed "pass" with its entire
+// diff uncommitted on a detached HEAD — work that existed nowhere in git
+// history and died with the checkout. "pass" must mean the work landed.
 
 // workRecordEnforceEnvVar gates whether work-record violations block the close
 // (enforce) or are logged only (warn-only, the default).
@@ -121,14 +127,17 @@ type passCloseChecks struct {
 	// commitOnAnyBranch reports whether the commit is reachable from at least
 	// one local or remote-tracking branch (a detached-HEAD-only commit is not).
 	commitOnAnyBranch func(commit string) bool
-	// dirtyPaths returns every changed or untracked path in the working tree
-	// (unfiltered; the validation applies the infrastructure exclusions).
+	// dirtyPaths returns every tracked path with uncommitted changes in the
+	// working tree or index (untracked and gitignored paths are already
+	// excluded; the validation applies the infrastructure exclusions on top).
 	dirtyPaths func() ([]string, error)
 }
 
 // passCloseInfraDirs are the top-level session-infrastructure directories whose
 // dirt never blocks a pass close: they are runtime state materialized into a
-// worker's checkout, not work product.
+// worker's checkout, not work product. Untracked paths are already excluded
+// wholesale by the dirty scan; this list additionally covers session
+// infrastructure the runtime mutates even when a rig tracks it.
 var passCloseInfraDirs = []string{".agents", ".codex", ".gc"}
 
 // passCloseDirtyPathsShown caps how many dirty paths a violation message names.
@@ -138,19 +147,26 @@ const passCloseDirtyPathsShown = 5
 // gc.outcome=pass against the landed-work contract and returns a
 // human-readable message per violation (empty ⇒ the close may proceed). The
 // contract: gc.work_commit must name a commit that exists and is reachable
-// from a branch, and the working tree must be clean of non-infrastructure
-// changes. Closes with any other gc.outcome (or none) are exempt — fail,
-// skipped, and canceled carry no landing. The caller is responsible for
-// scoping (isWorkRecordGatedBead).
+// from a branch, and the working tree must be clean of tracked-file
+// modifications. A typed no-op close (gc.work_outcome=no-op) is exempt from
+// the commit requirement — the work-record vocabulary this gate rides on
+// (ADR-0009) defines no-op as "the bead needed no change", so no commit
+// exists by contract — but a commit that IS stamped is still verified, and
+// the clean-tree requirement always applies. Closes with any other
+// gc.outcome (or none) are exempt — fail, skipped, and canceled carry no
+// landing. The caller is responsible for scoping (isWorkRecordGatedBead).
 func validatePassCloseOnClose(bead beads.Bead, checks passCloseChecks) []string {
 	if strings.TrimSpace(bead.Metadata[beadmeta.OutcomeMetadataKey]) != beadmeta.OutcomePass {
 		return nil
 	}
 	var violations []string
 	commit := strings.TrimSpace(bead.Metadata[beadmeta.WorkCommitMetadataKey])
+	noOp := strings.TrimSpace(bead.Metadata[beadmeta.WorkOutcomeMetadataKey]) == beadmeta.WorkOutcomeNoOp
 	switch {
 	case commit == "":
-		violations = append(violations, fmt.Sprintf("%s=%s requires %s (the commit that landed this bead's work)", beadmeta.OutcomeMetadataKey, beadmeta.OutcomePass, beadmeta.WorkCommitMetadataKey))
+		if !noOp {
+			violations = append(violations, fmt.Sprintf("%s=%s requires %s (the commit that landed this bead's work)", beadmeta.OutcomeMetadataKey, beadmeta.OutcomePass, beadmeta.WorkCommitMetadataKey))
+		}
 	case !checks.commitExists(commit):
 		violations = append(violations, fmt.Sprintf("%s %q names a commit that does not exist in the work repository", beadmeta.WorkCommitMetadataKey, commit))
 	case !checks.commitOnAnyBranch(commit):
@@ -160,7 +176,7 @@ func validatePassCloseOnClose(bead beads.Bead, checks passCloseChecks) []string 
 	if err != nil {
 		violations = append(violations, fmt.Sprintf("cannot verify the working tree is clean: %v", err))
 	} else if nonInfra := filterPassCloseDirtyPaths(dirty); len(nonInfra) > 0 {
-		violations = append(violations, fmt.Sprintf("the working tree has uncommitted non-infrastructure changes (%s)", summarizePassCloseDirtyPaths(nonInfra)))
+		violations = append(violations, fmt.Sprintf("the working tree has uncommitted changes to tracked files (%s)", summarizePassCloseDirtyPaths(nonInfra)))
 	}
 	return violations
 }
@@ -224,11 +240,16 @@ func gitCommitReachableFromAnyBranch(repoDir, commit string) bool {
 	return err == nil && strings.TrimSpace(string(out)) != ""
 }
 
-// gitDirtyWorkTreePaths returns every changed or untracked path reported by
-// `git status --porcelain -z` in repoDir, including both sides of a rename.
-// Ignored files are excluded by porcelain itself, so a path the repository has
-// deliberately gitignored never counts as dirt. Errors (including repoDir not
-// being a git repository) surface to the caller, which fails closed.
+// gitDirtyWorkTreePaths returns every tracked path with uncommitted changes
+// (worktree or index, including both sides of a rename) reported by
+// `git status --porcelain -z` in repoDir. Untracked paths ("??") are not
+// dirt: only modifications to tracked content can strand a bead's diff, and
+// real rigs accumulate hundreds of untracked runtime paths (.claude/,
+// worktrees/, local backups) that would otherwise make every pass close
+// impossible (ga-vx36). Ignored files are excluded by porcelain itself, so a
+// path the repository has deliberately gitignored never counts either.
+// Errors (including repoDir not being a git repository) surface to the
+// caller, which fails closed.
 func gitDirtyWorkTreePaths(repoDir string) ([]string, error) {
 	if strings.TrimSpace(repoDir) == "" {
 		return nil, fmt.Errorf("no work directory to inspect")
@@ -252,6 +273,10 @@ func gitDirtyWorkTreePaths(repoDir string) ([]string, error) {
 		record := records[i]
 		// "XY <path>": two status columns, a space, then the path.
 		if len(record) < 4 {
+			continue
+		}
+		// Untracked records ("??") carry no rename source and are not dirt.
+		if record[0] == '?' {
 			continue
 		}
 		paths = append(paths, record[3:])
