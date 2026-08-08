@@ -1435,9 +1435,9 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
-a recipient turn after sending. In a managed city, it can request a wake for
-a non-running recipient. Unread mail alone does not request a wake.
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --wake (or --notify)
+to request a recipient turn after sending. In a managed city, it can request
+a wake for a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
@@ -1447,7 +1447,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
-  gc mail send polecat "Priority task" --notify
+  gc mail send polecat "Priority task" --wake
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -1463,6 +1463,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&notify, "wake", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
 	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
@@ -1550,8 +1551,8 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to request a recipient turn after replying. In a managed city,
-it can request a wake for a non-running recipient.
+Use --wake (or --notify) to request a recipient turn after replying. In a
+managed city, it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.`,
 		Args: cobra.ArbitraryArgs,
@@ -1570,6 +1571,7 @@ Use -s/--subject for the reply subject and -m/--message for the reply body.`,
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reply body text")
+	cmd.Flags().BoolVar(&notify, "wake", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
 	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
@@ -1705,12 +1707,14 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		store           beads.Store
 		validRecipients map[string]bool
 		cfg             *config.City
+		notifySetupErr  error
 	)
 	cityPath, err := resolveCity()
 	if err == nil {
 		cfg, _ = loadCityConfig(cityPath, stderr)
 		store, err = openStoreAtForCity(cityPath, cityPath)
 	}
+	notifySetupErr = err
 	// Narrower than isStorelessMailProvider: exec: providers can legitimately
 	// run without a city store, but fake/fail still require one for alias
 	// resolution in tests. Do not unify with isStorelessMailProvider.
@@ -1752,6 +1756,11 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 	var nf nudgeFunc
 	if notify && store != nil {
 		nf = newMailNudgeFunc(sender)
+	} else if notify && store == nil {
+		if notifySetupErr == nil {
+			notifySetupErr = errors.New("city store unavailable")
+		}
+		fmt.Fprintf(stderr, "gc mail send: --wake requested but no city store available; recipient turn skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
 	}
 
 	// When --to is set, prepend it to args so doMailSend sees [to, body].
@@ -1855,6 +1864,9 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 			notified = true
 		}
 	}
+	if notified && !jsonOut {
+		fmt.Fprintf(stdout, "Recipient turn requested for %s\n", to) //nolint:errcheck // best-effort stdout
+	}
 	if jsonOut {
 		summary := summarizeMailMessage(m)
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", ID: m.ID, Message: &summary, Messages: []mailMessageSummary{summary}, Count: intRef(1), Notified: notified})
@@ -1922,6 +1934,9 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 				fmt.Fprintf(stderr, "gc mail send --all: nudge %s failed: %v\n", to, err) //nolint:errcheck // best-effort stderr
 			} else {
 				notified = true
+				if !jsonOut {
+					fmt.Fprintf(stdout, "Recipient turn requested for %s\n", to) //nolint:errcheck // best-effort stdout
+				}
 			}
 		}
 	}
@@ -2258,6 +2273,9 @@ func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject,
 		} else {
 			notified = true
 		}
+	}
+	if notified && !jsonOut {
+		fmt.Fprintf(stdout, "Recipient turn requested for %s\n", reply.To) //nolint:errcheck // best-effort stdout
 	}
 	if jsonOut {
 		summary := summarizeMailMessage(reply)

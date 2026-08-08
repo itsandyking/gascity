@@ -2392,8 +2392,8 @@ gc mail read <id> [flags]
 Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to request a recipient turn after replying. In a managed city,
-it can request a wake for a non-running recipient.
+Use --wake (or --notify) to request a recipient turn after replying. In a
+managed city, it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.
 
@@ -2407,15 +2407,16 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 | `-m`, `--message` | string |  | reply body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
 | `-s`, `--subject` | string |  | reply subject line |
+| `--wake` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
 
 ## gc mail send
 
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
-a recipient turn after sending. In a managed city, it can request a wake for
-a non-running recipient. Unread mail alone does not request a wake.
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --wake (or --notify)
+to request a recipient turn after sending. In a managed city, it can request
+a wake for a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
@@ -2433,7 +2434,7 @@ gc mail send mayor -s "Build is green"
 gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
 gc mail send --to mayor "Build is green"
 gc mail send human "Review needed for PR #42"
-gc mail send polecat "Priority task" --notify
+gc mail send polecat "Priority task" --wake
 gc mail send --all "Status update: tests passing"
 ```
 
@@ -2446,6 +2447,7 @@ gc mail send --all "Status update: tests passing"
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
+| `--wake` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
 
 ## gc mail thread
 

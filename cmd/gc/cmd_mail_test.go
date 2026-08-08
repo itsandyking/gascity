@@ -3010,6 +3010,36 @@ func TestMailNotifyHelpDocumentsManagedWake(t *testing.T) {
 			if !strings.Contains(cmd.Long, "Unread mail alone does not request a wake") {
 				t.Fatalf("Long help = %q, want unread-mail wake boundary", cmd.Long)
 			}
+			wake := cmd.Flags().Lookup("wake")
+			if wake == nil {
+				t.Fatal("--wake flag is missing")
+			}
+			if !strings.Contains(wake.Usage, "managed wake") {
+				t.Fatalf("--wake help = %q, want managed-wake behavior", wake.Usage)
+			}
+			if !strings.Contains(cmd.Long, "Use --wake") {
+				t.Fatalf("Long help = %q, want explicit --wake guidance", cmd.Long)
+			}
+		})
+	}
+}
+
+func TestMailWakeAliasEnablesNotifyFlag(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cmd  func(io.Writer, io.Writer) *cobra.Command
+	}{
+		{name: "send", cmd: newMailSendCmd},
+		{name: "reply", cmd: newMailReplyCmd},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := tt.cmd(io.Discard, io.Discard)
+			if err := cmd.Flags().Set("wake", "true"); err != nil {
+				t.Fatalf("set --wake: %v", err)
+			}
+			if got := cmd.Flags().Lookup("notify").Value.String(); got != "true" {
+				t.Fatalf("--notify value after --wake = %q, want true", got)
+			}
 		})
 	}
 }
@@ -3032,6 +3062,9 @@ func TestMailSendNotifySuccess(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Sent message gc-1 to mayor") {
 		t.Errorf("stdout = %q, want sent confirmation", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Recipient turn requested for mayor") {
+		t.Errorf("stdout = %q, want wake confirmation", stdout.String())
 	}
 	if nudged != "mayor" {
 		t.Errorf("nudgeFn called with %q, want %q", nudged, "mayor")
@@ -3060,6 +3093,54 @@ func TestMailSendNotifyNudgeError(t *testing.T) {
 	if !strings.Contains(stderr.String(), "nudge failed") {
 		t.Errorf("stderr = %q, want nudge failure warning", stderr.String())
 	}
+}
+
+func TestCmdMailSendWakeWithoutCityWarnsAndSendsMail(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "exec:"+writeExecSendScript(t))
+	t.Setenv("GC_SESSION", "fake")
+	t.Setenv("GC_CITY", "")
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"alice", "time-sensitive body"}, true, false, "human", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Sent message exec-send-1 to alice") {
+		t.Fatalf("stdout = %q, want send confirmation", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--wake requested but no city store available") {
+		t.Fatalf("stderr = %q, want wake warning", stderr.String())
+	}
+}
+
+func writeExecSendScript(t *testing.T) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "mail-exec-send")
+	data := `#!/bin/sh
+case "$1" in
+  ensure-running)
+    exit 0
+    ;;
+  send)
+    cat >/dev/null
+    printf '{"id":"exec-send-1","from":"human","to":"%s","subject":"","body":"time-sensitive body","created_at":"2026-08-08T00:00:00Z","read":false,"thread_id":"thread-1"}\n' "$2"
+    exit 0
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(data), 0o755); err != nil {
+		t.Fatalf("WriteFile(send script): %v", err)
+	}
+	return script
 }
 
 func TestMailSendNotifyToHuman(t *testing.T) {
