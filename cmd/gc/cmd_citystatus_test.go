@@ -159,6 +159,40 @@ func TestCityStatusObservationTimesOut(t *testing.T) {
 	}
 }
 
+func TestCityStatusObservationUnboundedWhenDisabled(t *testing.T) {
+	oldTimeout := statusObservationTimeout
+	statusObservationTimeout = 0
+	t.Cleanup(func() { statusObservationTimeout = oldTimeout })
+
+	oldObserve := observeSessionTargetForStatus
+	observeSessionTargetForStatus = func(string, beads.Store, runtime.Provider, *config.City, string) (worker.LiveObservation, error) {
+		time.Sleep(30 * time.Millisecond)
+		return worker.LiveObservation{Running: true}, nil
+	}
+	t.Cleanup(func() { observeSessionTargetForStatus = oldObserve })
+
+	sp := newBoundedStatusProvider(runtime.NewFake())
+	var stderr bytes.Buffer
+	obs := observeSessionTargetWithWarning(
+		"gc status",
+		"/city",
+		nil,
+		sp,
+		&config.City{},
+		statusObservationTarget{runtimeSessionName: "slow-session"},
+		&stderr,
+	)
+	if !obs.Running {
+		t.Fatal("observation dropped; want the real result when the observation bound is disabled")
+	}
+	if statusProviderPartial(sp) {
+		t.Fatal("statusProviderPartial = true, want false with bounds disabled")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want no warnings", stderr.String())
+	}
+}
+
 func TestCityStatusSuspended(t *testing.T) {
 	sp := runtime.NewFake()
 	dops := newFakeDrainOps()

@@ -113,8 +113,9 @@ var (
 
 var (
 	controllerStatusStandaloneFallbackTimeout = 250 * time.Millisecond
-	statusObservationTimeout                  = 750 * time.Millisecond
-	statusSessionSnapshotTimeout              = 3 * time.Second
+	// statusObservationTimeout is declared with the per-call probe bound it
+	// composes with in status_provider.go.
+	statusSessionSnapshotTimeout = 3 * time.Second
 )
 
 // newStatusCmd creates the "gc status [path]" command.
@@ -372,14 +373,12 @@ func observeSessionTargetWithWarning(
 		observation worker.LiveObservation
 		err         error
 	}
-	done := make(chan observeResult, 1)
-	go func() {
-		obs, err := observeSessionTargetForStatus(cityPath, nil, sp, cfg, target.runtimeSessionName)
-		done <- observeResult{observation: obs, err: err}
-	}()
-
-	select {
-	case result := <-done:
+	observeTarget := observeSessionTargetForStatus
+	observe := func() observeResult {
+		obs, err := observeTarget(cityPath, nil, sp, cfg, target.runtimeSessionName)
+		return observeResult{observation: obs, err: err}
+	}
+	finish := func(result observeResult) worker.LiveObservation {
 		if result.err != nil {
 			markStatusProviderPartial(sp)
 			if stderr != nil {
@@ -387,6 +386,18 @@ func observeSessionTargetWithWarning(
 			}
 		}
 		return result.observation
+	}
+	if statusObservationTimeout <= 0 {
+		return finish(observe())
+	}
+	done := make(chan observeResult, 1)
+	go func() {
+		done <- observe()
+	}()
+
+	select {
+	case result := <-done:
+		return finish(result)
 	case <-time.After(statusObservationTimeout):
 		markStatusProviderPartial(sp)
 		if stderr != nil {

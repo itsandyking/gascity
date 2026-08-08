@@ -197,6 +197,7 @@ func newStatusSessionProviderForCity(cfg *config.City, cityPath string) (runtime
 }
 
 func newStatusSessionProviderForCityWithSnapshot(cfg *config.City, cityPath string, sessionBeads *sessionBeadSnapshot) (runtime.Provider, error) {
+	applyStatusProbeTimeoutEnv()
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
 	sp, err := withSessionProviderConstructionContext(newSessionProviderFromContext(ctx, sessionBeads))
 	if err != nil {

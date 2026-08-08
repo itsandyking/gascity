@@ -76,6 +76,123 @@ func TestStatusProviderPreservesNativeLivenessObservation(t *testing.T) {
 	}
 }
 
+func TestStatusProbeTimeoutDefaultsCompose(t *testing.T) {
+	// ga-u5hh regression guard: a 50ms per-call default flipped gc status to
+	// partial on healthy cities. Three sequential tmux round-trips under the
+	// status command's own 8-way fan-out already measure ~40-50ms on a lightly
+	// loaded host, and reconciler dispatch load pushes single round-trips well
+	// past 50ms. The per-call bound must keep real headroom over a loaded tmux
+	// round-trip.
+	if statusProviderCallTimeout < 250*time.Millisecond {
+		t.Fatalf("statusProviderCallTimeout = %s, want >= 250ms headroom over loaded tmux round-trips", statusProviderCallTimeout)
+	}
+	// One observation issues up to statusObservationCallBudget bounded
+	// provider calls sequentially; an observation bound tighter than that
+	// budget re-introduces the same false partial one level up.
+	if statusObservationTimeout < statusObservationCallBudget*statusProviderCallTimeout {
+		t.Fatalf("statusObservationTimeout = %s, want >= %d x statusProviderCallTimeout (%s)",
+			statusObservationTimeout, statusObservationCallBudget, statusProviderCallTimeout)
+	}
+}
+
+func TestStatusProbeTimeoutEnvOverride(t *testing.T) {
+	origCall := statusProviderCallTimeout
+	origObs := statusObservationTimeout
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origCall
+		statusObservationTimeout = origObs
+	})
+
+	t.Setenv(statusProbeTimeoutEnvVar, "2s")
+	applyStatusProbeTimeoutEnv()
+	if statusProviderCallTimeout != 2*time.Second {
+		t.Fatalf("statusProviderCallTimeout = %s, want 2s from env override", statusProviderCallTimeout)
+	}
+	if want := statusObservationCallBudget * 2 * time.Second; statusObservationTimeout != want {
+		t.Fatalf("statusObservationTimeout = %s, want %s derived from env override", statusObservationTimeout, want)
+	}
+}
+
+func TestStatusProbeTimeoutEnvOverrideKeepsObservationFloor(t *testing.T) {
+	origCall := statusProviderCallTimeout
+	origObs := statusObservationTimeout
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origCall
+		statusObservationTimeout = origObs
+	})
+
+	t.Setenv(statusProbeTimeoutEnvVar, "100ms")
+	applyStatusProbeTimeoutEnv()
+	if statusProviderCallTimeout != 100*time.Millisecond {
+		t.Fatalf("statusProviderCallTimeout = %s, want 100ms from env override", statusProviderCallTimeout)
+	}
+	if statusObservationTimeout != defaultStatusObservationTimeout {
+		t.Fatalf("statusObservationTimeout = %s, want default floor %s for a small per-call override",
+			statusObservationTimeout, defaultStatusObservationTimeout)
+	}
+}
+
+func TestStatusProbeTimeoutEnvZeroDisablesBounds(t *testing.T) {
+	origCall := statusProviderCallTimeout
+	origObs := statusObservationTimeout
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origCall
+		statusObservationTimeout = origObs
+	})
+
+	t.Setenv(statusProbeTimeoutEnvVar, "0")
+	applyStatusProbeTimeoutEnv()
+	if statusProviderCallTimeout != 0 {
+		t.Fatalf("statusProviderCallTimeout = %s, want 0 (bounds disabled)", statusProviderCallTimeout)
+	}
+	if statusObservationTimeout != 0 {
+		t.Fatalf("statusObservationTimeout = %s, want 0 (bounds disabled)", statusObservationTimeout)
+	}
+}
+
+func TestStatusProbeTimeoutEnvUnsetLeavesSeamsAlone(t *testing.T) {
+	origCall := statusProviderCallTimeout
+	origObs := statusObservationTimeout
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origCall
+		statusObservationTimeout = origObs
+	})
+
+	t.Setenv(statusProbeTimeoutEnvVar, "")
+	statusProviderCallTimeout = 12 * time.Millisecond
+	statusObservationTimeout = 34 * time.Millisecond
+	applyStatusProbeTimeoutEnv()
+	if statusProviderCallTimeout != 12*time.Millisecond || statusObservationTimeout != 34*time.Millisecond {
+		t.Fatalf("timeouts = (%s, %s), want test-seam values untouched when env is unset",
+			statusProviderCallTimeout, statusObservationTimeout)
+	}
+}
+
+func TestStatusProbeTimeoutEnvInvalidWarnsAndKeepsDefaults(t *testing.T) {
+	origCall := statusProviderCallTimeout
+	origObs := statusObservationTimeout
+	origWarn := statusProbeTimeoutEnvWarning
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origCall
+		statusObservationTimeout = origObs
+		statusProbeTimeoutEnvWarning = origWarn
+	})
+	var warned atomic.Int32
+	statusProbeTimeoutEnvWarning = func(string) { warned.Add(1) }
+
+	for _, raw := range []string{"bogus", "-5s"} {
+		t.Setenv(statusProbeTimeoutEnvVar, raw)
+		applyStatusProbeTimeoutEnv()
+		if statusProviderCallTimeout != origCall || statusObservationTimeout != origObs {
+			t.Fatalf("timeouts = (%s, %s) after %q, want untouched (%s, %s)",
+				statusProviderCallTimeout, statusObservationTimeout, raw, origCall, origObs)
+		}
+	}
+	if got := warned.Load(); got != 2 {
+		t.Fatalf("invalid-env warnings = %d, want 2", got)
+	}
+}
+
 func TestStatusProviderTimeoutMarksPartial(t *testing.T) {
 	origTimeout := statusProviderCallTimeout
 	origWarn := statusProviderTimeoutWarning
