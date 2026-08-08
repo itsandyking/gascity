@@ -308,10 +308,13 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// contract (ga-dnay) rides the same gate and ALWAYS blocks: gc.outcome=pass
 	// requires an existing, branch-reachable gc.work_commit (except typed
 	// gc.work_outcome=no-op closes) and a working tree clean of tracked-file
-	// modifications (ga-vx36). Reuses the store/beads the write-ID guard above
-	// already opened and read, and the config the caller already loaded.
-	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr) {
-		return 1
+	// modifications (ga-vx36), and a close target the gate cannot read fails
+	// closed (ga-c6sz). Reuses the store/beads the write-ID guard above
+	// already opened and read, and the config the caller already loaded. The
+	// gate's nonzero code is the exit code — bdSilentFallbackExitCode when the
+	// refusal is bd's silent-fallback mode, preserving the #2079/#2080 contract.
+	if code := runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr); code != 0 {
+		return code
 	}
 
 	reapStaleBdExportJSONL(target.ScopeRoot)

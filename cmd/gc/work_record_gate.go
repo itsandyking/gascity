@@ -39,6 +39,16 @@ import (
 // exists to catch. Twice on 2026-08-07 a worker closed "pass" with its entire
 // diff uncommitted on a detached HEAD — work that existed nowhere in git
 // history and died with the checkout. "pass" must mean the work landed.
+//
+// Because the pass-close contract is always enforced, it also fails closed
+// when its own verification is unavailable (ga-c6sz): a close whose target
+// bead cannot be loaded — store open failure, store.Get failure, projection
+// lag — or whose final metadata cannot be computed is refused unless the
+// invocation itself provably pins a non-pass gc.outcome. The read path being
+// unhealthy is precisely when an unverified "pass" is most dangerous. Closes
+// that pin a non-pass outcome in their own argv keep the best-effort
+// migration behavior: they carry no landing claim, and refusing them during
+// a read-path outage would strand honest failure bookkeeping fleet-wide.
 
 // workRecordEnforceEnvVar gates whether work-record violations block the close
 // (enforce) or are logged only (warn-only, the default).
@@ -208,6 +218,76 @@ func filterPassCloseDirtyPaths(paths []string) []string {
 	return nonInfra
 }
 
+// passCloseArgvDisposition classifies what a close invocation's own metadata
+// edits do to the control-plane gc.outcome, from argv alone. It is the
+// fail-closed decision input when the stored bead cannot be read: a close is
+// allowed to proceed unverified only when argv proves it cannot be a pass
+// close.
+type passCloseArgvDisposition int
+
+const (
+	// passCloseArgvUndecided: argv alone does not decide the final
+	// gc.outcome. The stored bead's value survives (bare `bd close`, an
+	// update not touching the key, an additive --metadata object without
+	// it), or the projection cannot be computed at all (malformed or @file
+	// metadata). An undecided close may be a pass close.
+	passCloseArgvUndecided passCloseArgvDisposition = iota
+	// passCloseArgvPass: the invocation definitively stamps
+	// gc.outcome=pass, regardless of the stored value.
+	passCloseArgvPass
+	// passCloseArgvNonPass: the invocation definitively leaves gc.outcome
+	// set to a non-pass value or removes the key, regardless of the stored
+	// value.
+	passCloseArgvNonPass
+)
+
+// passCloseDispositionFromArgs computes the argv-only gc.outcome disposition
+// of a close invocation. It projects the invocation's metadata edits onto a
+// sentinel value through the same applyWorkRecordUpdateMetadata used for
+// validation, so the classification shares bd's exact edit semantics (last
+// --metadata wins, --set-metadata before --unset-metadata, flag-value
+// consumption, `--` termination) instead of a second parser that could
+// drift. The result is sound by construction: passCloseArgvNonPass is
+// reported only when the projection proves the final outcome cannot be pass.
+func passCloseDispositionFromArgs(bdArgs []string) passCloseArgvDisposition {
+	// NUL can't appear in real metadata and is not trimmed as whitespace, so
+	// the sentinel surviving the projection proves argv never wrote the key.
+	const outcomeSentinel = "\x00undecided"
+	probe := beads.Bead{Metadata: beads.StringMap{beadmeta.OutcomeMetadataKey: outcomeSentinel}}
+	projected, err := applyWorkRecordUpdateMetadata(probe, bdArgs)
+	if err != nil {
+		return passCloseArgvUndecided
+	}
+	outcome, present := projected.Metadata[beadmeta.OutcomeMetadataKey]
+	switch {
+	case present && outcome == outcomeSentinel:
+		return passCloseArgvUndecided
+	case strings.TrimSpace(outcome) == beadmeta.OutcomePass:
+		return passCloseArgvPass
+	default:
+		return passCloseArgvNonPass
+	}
+}
+
+// handleUnverifiableClose decides one close target whose bead cannot be
+// loaded (store open failure, store.Get failure, projection lag) and reports
+// whether the close must be blocked. A close whose argv pins a non-pass
+// gc.outcome proceeds with a skip note: it carries no landing claim, and the
+// non-pass paths (failure reports, drain bookkeeping) must keep working
+// through a read-path outage. Every other close is refused — the pass-close
+// contract is always enforced, and a close that cannot be classified could
+// be the documented stamp-then-close pass form whose outcome lives only on
+// the unreadable stored bead.
+func handleUnverifiableClose(id string, disposition passCloseArgvDisposition, cause error, stderr io.Writer) bool {
+	if disposition == passCloseArgvNonPass {
+		fmt.Fprintf(stderr, "gc bd: work-record gate: close of %s: skipping validation — cannot load the bead (%v); the close itself pins a non-pass %s, so the always-enforced pass-close contract cannot apply\n", id, cause, beadmeta.OutcomeMetadataKey) //nolint:errcheck // best-effort stderr
+		return false
+	}
+	fmt.Fprintf(stderr, "gc bd: pass-close gate: close of %s: cannot load the bead to verify the close: %v\n", id, cause)                                                                                                                                                                                                                                                                                                                                                     //nolint:errcheck // best-effort stderr
+	fmt.Fprintf(stderr, "gc bd: pass-close gate: refusing close of %s — %s=%s closes are always verified against the landed-work contract and this close cannot be proven non-pass without reading the bead; retry when the beads read path is healthy, or report a genuine failure atomically with `bd update %s --status=closed --set-metadata %s=%s ...`\n", id, beadmeta.OutcomeMetadataKey, beadmeta.OutcomePass, id, beadmeta.OutcomeMetadataKey, beadmeta.OutcomeFail) //nolint:errcheck // best-effort stderr
+	return true
+}
+
 // summarizePassCloseDirtyPaths renders a dirty-path list for a violation
 // message, capping how many are named so a large diff doesn't flood stderr.
 func summarizePassCloseDirtyPaths(paths []string) string {
@@ -372,10 +452,14 @@ func bdUpdateClosesStatus(bdArgs []string) bool {
 
 // runWorkRecordCloseGate validates every bead a `gc bd close` (or
 // `gc bd update --status=closed`) invocation closes against the work-record
-// contract and the pass-close contract. Best-effort: it never blocks on its
-// own read failure. Returns whether the close should be blocked — work-record
-// violations block only when enforcement is enabled; pass-close violations
-// always block.
+// contract and the pass-close contract. It returns the exit code the close
+// should fail with: 0 means the close may proceed, 1 means it is blocked
+// (work-record violations block only when enforcement is enabled; pass-close
+// violations always block), and bdSilentFallbackExitCode means the read seam
+// is in bd's silent-fallback mode. The gate's own read failures are
+// best-effort only for closes that provably cannot claim gc.outcome=pass;
+// a close that may be a pass close is refused when it cannot be verified
+// (fail closed — see the package comment, ga-c6sz).
 //
 // preOpened and preFetched let a caller that already opened the store and
 // fetched the target beads (e.g. the write-ID collision guard, which reads
@@ -383,17 +467,26 @@ func bdUpdateClosesStatus(bdArgs []string) bool {
 // them in instead of paying a second openStoreAtForCity + store.Get round
 // trip. Both are optional (nil is fine): preOpened falls back to opening its
 // own store, and any ID missing from preFetched falls back to store.Get.
-func runWorkRecordCloseGate(bdArgs []string, scopeRoot, cityPath string, cfg *config.City, preOpened beads.Store, preFetched map[string]beads.Bead, stderr io.Writer) bool {
-	if _, ok := workRecordCloseTargets(bdArgs); !ok {
-		return false
+func runWorkRecordCloseGate(bdArgs []string, scopeRoot, cityPath string, cfg *config.City, preOpened beads.Store, preFetched map[string]beads.Bead, stderr io.Writer) int {
+	ids, ok := workRecordCloseTargets(bdArgs)
+	if !ok {
+		return 0
 	}
 	store := preOpened
 	if store == nil {
 		var err error
 		store, err = openStoreAtForCityWithConfig(scopeRoot, cityPath, cfg)
 		if err != nil {
-			// Cannot verify — never block a close on our own read failure.
-			return false
+			// No store means no bead can be loaded or classified: refuse
+			// every target the invocation cannot prove non-pass.
+			disposition := passCloseDispositionFromArgs(bdArgs)
+			code := 0
+			for _, id := range ids {
+				if handleUnverifiableClose(id, disposition, fmt.Errorf("opening beads store: %w", err), stderr) {
+					code = 1
+				}
+			}
+			return code
 		}
 	}
 	return evaluateWorkRecordCloseGate(bdArgs, store, preFetched, scopeRoot, workRecordEnforceEnabled(), stderr)
@@ -401,24 +494,51 @@ func runWorkRecordCloseGate(bdArgs []string, scopeRoot, cityPath string, cfg *co
 
 // evaluateWorkRecordCloseGate is the store-driven core of the close gate, split
 // from the IO wrapper so it is unit-testable with an in-memory store. It logs
-// each violation and reports whether the close should be blocked. preFetched
-// (optional) supplies beads already read by an earlier guard in this same
-// invocation, avoiding a duplicate store.Get for the same ID.
-func evaluateWorkRecordCloseGate(bdArgs []string, store beads.Store, preFetched map[string]beads.Bead, scopeRoot string, enforce bool, stderr io.Writer) (block bool) {
+// each violation and returns the exit code the close should fail with (0 ⇒
+// proceed; see runWorkRecordCloseGate for the code vocabulary). A target
+// bead that cannot be read fails closed unless the invocation provably pins a
+// non-pass gc.outcome (see handleUnverifiableClose). preFetched (optional)
+// supplies beads already read by an earlier guard in this same invocation,
+// avoiding a duplicate store.Get for the same ID.
+func evaluateWorkRecordCloseGate(bdArgs []string, store beads.Store, preFetched map[string]beads.Bead, scopeRoot string, enforce bool, stderr io.Writer) int {
 	ids, ok := workRecordCloseTargets(bdArgs)
 	if !ok {
-		return false
+		return 0
 	}
 	mode := "warn-only"
 	if enforce {
 		mode = "enforced"
 	}
+	var block, silentFallback bool
+	argvDisposition := passCloseDispositionFromArgs(bdArgs)
 	for _, id := range ids {
 		bead, cached := preFetched[id]
 		if !cached {
 			var getErr error
 			bead, getErr = store.Get(id)
 			if getErr != nil {
+				if errors.Is(getErr, beads.ErrBDSilentFallback) {
+					// The read seam is in bd's silent-fallback mode: nothing
+					// this invocation writes will persist (#2079/#2080), so
+					// refuse outright with the established loud-fallback
+					// contract instead of the generic unverifiable-close
+					// refusal — and independent of argv disposition, since a
+					// doomed non-pass write has nothing to preserve either.
+					// Pre-hardening, this invocation also ended in the
+					// fallback exit code, via the post-subprocess stderr scan.
+					fmt.Fprintf(stderr, "gc bd: pass-close gate: close of %s: cannot load the bead to verify the close: %v\n", id, getErr) //nolint:errcheck // best-effort stderr
+					fmt.Fprintln(stderr, bdSilentFallbackUserMessage)                                                                      //nolint:errcheck // best-effort stderr
+					silentFallback = true
+					continue
+				}
+				// The bead cannot be loaded, so it cannot be classified
+				// (task vs control, pass vs non-pass): fail closed unless
+				// the invocation itself pins a non-pass outcome. A lagging
+				// read seam is exactly when the documented stamp-then-close
+				// pass form would otherwise slip through unverified.
+				if handleUnverifiableClose(id, argvDisposition, getErr, stderr) {
+					block = true
+				}
 				continue
 			}
 		}
@@ -427,23 +547,32 @@ func evaluateWorkRecordCloseGate(bdArgs []string, store beads.Store, preFetched 
 		}
 		var projectionErr error
 		bead, projectionErr = applyWorkRecordUpdateMetadata(bead, bdArgs)
+		if projectionErr != nil {
+			// A close whose final metadata cannot be computed cannot be
+			// checked against the always-enforced pass-close contract — an
+			// unresolvable projection (e.g. --metadata @file, which bd
+			// accepts but this preflight deliberately does not read) could
+			// stamp or clear gc.outcome=pass. Refuse outright instead of
+			// riding the migration-mode enforce switch: every non-@file
+			// shape that errors here is one bd itself rejects downstream,
+			// so the refusal only changes @file closes of gated work beads.
+			fmt.Fprintf(stderr, "gc bd: pass-close gate: close of %s: %v\n", id, projectionErr)                                                                                                   //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc bd: pass-close gate: refusing close of %s — rewrite the close with inline metadata flags so its final %s can be verified\n", id, beadmeta.OutcomeMetadataKey) //nolint:errcheck // best-effort stderr
+			block = true
+			continue
+		}
 		repoDir := strings.TrimSpace(bead.Metadata[beadmeta.WorkDirMetadataKey])
 		if repoDir == "" {
 			repoDir = scopeRoot
 		}
-		var violations, passViolations []string
-		if projectionErr != nil {
-			violations = []string{projectionErr.Error()}
-		} else {
-			violations = validateWorkRecordOnClose(bead, func(commit, branch string) bool {
-				return gitCommitReachableOnBranch(repoDir, commit, branch)
-			})
-			passViolations = validatePassCloseOnClose(bead, passCloseChecks{
-				commitExists:      func(commit string) bool { return gitCommitExists(repoDir, commit) },
-				commitOnAnyBranch: func(commit string) bool { return gitCommitReachableFromAnyBranch(repoDir, commit) },
-				dirtyPaths:        func() ([]string, error) { return gitDirtyWorkTreePaths(repoDir) },
-			})
-		}
+		violations := validateWorkRecordOnClose(bead, func(commit, branch string) bool {
+			return gitCommitReachableOnBranch(repoDir, commit, branch)
+		})
+		passViolations := validatePassCloseOnClose(bead, passCloseChecks{
+			commitExists:      func(commit string) bool { return gitCommitExists(repoDir, commit) },
+			commitOnAnyBranch: func(commit string) bool { return gitCommitReachableFromAnyBranch(repoDir, commit) },
+			dirtyPaths:        func() ([]string, error) { return gitDirtyWorkTreePaths(repoDir) },
+		})
 		for _, v := range violations {
 			fmt.Fprintf(stderr, "gc bd: work-record gate (%s): close of %s: %s\n", mode, id, v) //nolint:errcheck // best-effort stderr
 		}
@@ -462,7 +591,14 @@ func evaluateWorkRecordCloseGate(bdArgs []string, store beads.Store, preFetched 
 			block = true
 		}
 	}
-	return block
+	switch {
+	case silentFallback:
+		return bdSilentFallbackExitCode
+	case block:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // workRecordMetadataEdits is the parsed metadata mutation of a `bd update` arg

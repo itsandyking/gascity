@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -321,7 +323,7 @@ func TestEvaluateWorkRecordCloseGate(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stderr strings.Builder
-			block := evaluateWorkRecordCloseGate(tc.args, newStore(), nil, t.TempDir(), tc.enforce, &stderr)
+			block := evaluateWorkRecordCloseGate(tc.args, newStore(), nil, t.TempDir(), tc.enforce, &stderr) != 0
 			if block != tc.wantBlock {
 				t.Fatalf("block = %v, want %v; stderr=%s", block, tc.wantBlock, stderr.String())
 			}
@@ -368,7 +370,7 @@ func TestEvaluateWorkRecordCloseGateAtomicShippedUpdate(t *testing.T) {
 		"--status=closed",
 	}
 	var stderr strings.Builder
-	if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, true, &stderr); block {
+	if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, true, &stderr); block != 0 {
 		t.Fatalf("valid atomic shipped close blocked; stderr=%s", stderr.String())
 	}
 	if got := stderr.String(); got != "" {
@@ -392,7 +394,7 @@ func TestEvaluateWorkRecordCloseGateUsesPreFetchedBead(t *testing.T) {
 		"wr-shipped-nocommit": {ID: "wr-shipped-nocommit", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeShipped}},
 	}
 	var stderr strings.Builder
-	block := evaluateWorkRecordCloseGate([]string{"close", "wr-shipped-nocommit"}, panicOnGetStore{}, preFetched, t.TempDir(), true, &stderr)
+	block := evaluateWorkRecordCloseGate([]string{"close", "wr-shipped-nocommit"}, panicOnGetStore{}, preFetched, t.TempDir(), true, &stderr) != 0
 	if !block {
 		t.Fatalf("expected block=true for shipped-without-commit, got false; stderr=%s", stderr.String())
 	}
@@ -404,11 +406,12 @@ func TestEvaluateWorkRecordCloseGateUsesPreFetchedBead(t *testing.T) {
 // TestRunWorkRecordCloseGateReusesPreOpenedStore proves runWorkRecordCloseGate
 // never calls openStoreAtForCity when handed a preOpened store — it's the IO
 // wrapper's half of the dedup (evaluateWorkRecordCloseGate proves the
-// preFetched-bead half above). cityPath is deliberately bogus: opening a
-// real store at it would fail, causing the gate to fail open (block=false, no
-// stderr) — indistinguishable from a no-op success. Asserting a violation
-// fires instead proves preOpened/preFetched were actually used, not silently
-// bypassed by a failed fallback open.
+// preFetched-bead half above). cityPath is deliberately bogus: a gate that
+// silently dropped preOpened/preFetched would fall back to opening or reading
+// a real store there and fail, producing an unverifiable-close refusal
+// ("pass-close gate ... cannot load the bead") instead of the work-record
+// violation the pre-read bead carries. Asserting the enforced work-record
+// violation fires proves the handed-in store and beads were actually used.
 func TestRunWorkRecordCloseGateReusesPreOpenedStore(t *testing.T) {
 	preFetched := map[string]beads.Bead{
 		"wr-shipped-nocommit": {ID: "wr-shipped-nocommit", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeShipped}},
@@ -416,12 +419,244 @@ func TestRunWorkRecordCloseGateReusesPreOpenedStore(t *testing.T) {
 	var stderr strings.Builder
 	const bogusCityPath = "/nonexistent/does-not-exist"
 	t.Setenv(workRecordEnforceEnvVar, "1")
-	block := runWorkRecordCloseGate([]string{"close", "wr-shipped-nocommit"}, t.TempDir(), bogusCityPath, nil, panicOnGetStore{}, preFetched, &stderr)
+	block := runWorkRecordCloseGate([]string{"close", "wr-shipped-nocommit"}, t.TempDir(), bogusCityPath, nil, panicOnGetStore{}, preFetched, &stderr) != 0
 	if !block {
 		t.Fatalf("expected block=true for shipped-without-commit, got false (fallback store open may have silently swallowed the preOpened store); stderr=%s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "work-record gate (enforced)") {
 		t.Fatalf("expected enforced gate output, got %q", stderr.String())
+	}
+}
+
+func TestPassCloseDispositionFromArgs(t *testing.T) {
+	outcomeKey := beadmeta.OutcomeMetadataKey
+	tests := []struct {
+		name string
+		args []string
+		want passCloseArgvDisposition
+	}{
+		{"bare close is undecided", []string{"close", "wr-x"}, passCloseArgvUndecided},
+		{"close with reason is undecided", []string{"close", "wr-x", "--reason", "done"}, passCloseArgvUndecided},
+		{"update without outcome edit is undecided", []string{"update", "wr-x", "--status=closed"}, passCloseArgvUndecided},
+		{"set pass is pass", []string{"update", "wr-x", "--set-metadata", outcomeKey + "=" + beadmeta.OutcomePass, "--status=closed"}, passCloseArgvPass},
+		{"set fail is non-pass", []string{"update", "wr-x", "--set-metadata", outcomeKey + "=" + beadmeta.OutcomeFail, "--status=closed"}, passCloseArgvNonPass},
+		{"last repeated set wins toward non-pass", []string{"update", "wr-x", "--set-metadata", outcomeKey + "=" + beadmeta.OutcomePass, "--set-metadata", outcomeKey + "=" + beadmeta.OutcomeFail, "--status=closed"}, passCloseArgvNonPass},
+		{"last repeated set wins toward pass", []string{"update", "wr-x", "--set-metadata", outcomeKey + "=" + beadmeta.OutcomeFail, "--set-metadata", outcomeKey + "=" + beadmeta.OutcomePass, "--status=closed"}, passCloseArgvPass},
+		{"unset beats set regardless of argv order", []string{"update", "wr-x", "--unset-metadata", outcomeKey, "--set-metadata", outcomeKey + "=" + beadmeta.OutcomePass, "--status=closed"}, passCloseArgvNonPass},
+		{"metadata JSON stamping pass is pass", []string{"update", "wr-x", "--metadata", `{"gc.outcome":"pass"}`, "--status=closed"}, passCloseArgvPass},
+		{"metadata JSON stamping fail is non-pass", []string{"update", "wr-x", "--metadata", `{"gc.outcome":"fail"}`, "--status=closed"}, passCloseArgvNonPass},
+		{"additive metadata JSON without the key is undecided", []string{"update", "wr-x", "--metadata", `{"other":"v"}`, "--status=closed"}, passCloseArgvUndecided},
+		{"malformed metadata JSON is undecided", []string{"update", "wr-x", "--metadata", "{not-json}", "--status=closed"}, passCloseArgvUndecided},
+		{"metadata file input is undecided", []string{"update", "wr-x", "--metadata", "@close.json", "--status=closed"}, passCloseArgvUndecided},
+		{"metadata JSON combined with set-metadata is undecided", []string{"update", "wr-x", "--metadata", `{"gc.outcome":"fail"}`, "--set-metadata", "a=b", "--status=closed"}, passCloseArgvUndecided},
+		{"outcome-looking positional after terminator is undecided", []string{"update", "wr-x", "--status=closed", "--", "--set-metadata=" + outcomeKey + "=" + beadmeta.OutcomeFail}, passCloseArgvUndecided},
+		{"outcome-looking flag value is undecided", []string{"update", "wr-x", "--notes", "--set-metadata=" + outcomeKey + "=" + beadmeta.OutcomeFail, "--status=closed"}, passCloseArgvUndecided},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := passCloseDispositionFromArgs(tc.args); got != tc.want {
+				t.Fatalf("passCloseDispositionFromArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// brokenStoreCity returns a city path whose store open deterministically
+// fails: its city.toml names the removed sqlite provider, which
+// openStoreResultAtForCityWithConfig rejects with a hard error before any
+// store is constructed (the same fixture as
+// TestOpenStoreResultAtForCityRejectsRemovedSQLiteProvider).
+func brokenStoreCity(t *testing.T) string {
+	t.Helper()
+	cityDir := t.TempDir()
+	cityToml := "[workspace]\nname = \"broken-store-city\"\nprefix = \"ga\"\n\n[beads]\nprovider = \"sqlite\"\n"
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cityDir
+}
+
+// TestRunWorkRecordCloseGateFailsClosedWithoutStore proves the store-open
+// failure path (ga-c6sz): when the gate cannot open its store, a close that
+// may carry gc.outcome=pass — a bare close of a bead whose outcome was
+// stamped earlier, or an atomic update stamping pass — is refused with an
+// actionable error, while a close that pins a non-pass outcome in its own
+// argv proceeds (failure bookkeeping must survive a read-path outage).
+// preOpened/preFetched are nil, matching production when the write-ID
+// guard's open also failed.
+func TestRunWorkRecordCloseGateFailsClosedWithoutStore(t *testing.T) {
+	t.Run("bare close is refused", func(t *testing.T) {
+		cityDir := brokenStoreCity(t)
+		var stderr strings.Builder
+		block := runWorkRecordCloseGate([]string{"close", "wr-unverified"}, cityDir, cityDir, nil, nil, nil, &stderr) != 0
+		if !block {
+			t.Fatalf("expected block=true for unverifiable bare close, got false; stderr=%s", stderr.String())
+		}
+		for _, want := range []string{"pass-close gate", "refusing close of wr-unverified", "cannot load the bead", "opening beads store", "no longer supported"} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr %q does not contain %q", stderr.String(), want)
+			}
+		}
+	})
+
+	t.Run("atomic pass close is refused", func(t *testing.T) {
+		cityDir := brokenStoreCity(t)
+		args := []string{"update", "wr-unverified", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass, "--status=closed"}
+		var stderr strings.Builder
+		if block := runWorkRecordCloseGate(args, cityDir, cityDir, nil, nil, nil, &stderr); block == 0 {
+			t.Fatalf("expected block=true for unverifiable atomic pass close, got false; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic non-pass close proceeds with a skip note", func(t *testing.T) {
+		cityDir := brokenStoreCity(t)
+		args := []string{"update", "wr-unverified", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomeFail, "--status=closed"}
+		var stderr strings.Builder
+		if block := runWorkRecordCloseGate(args, cityDir, cityDir, nil, nil, nil, &stderr); block != 0 {
+			t.Fatalf("non-pass close blocked on store-open failure; stderr=%s", stderr.String())
+		}
+		for _, want := range []string{"skipping validation", "non-pass"} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr %q does not contain %q", stderr.String(), want)
+			}
+		}
+	})
+
+	t.Run("non-close invocation stays untouched", func(t *testing.T) {
+		cityDir := brokenStoreCity(t)
+		var stderr strings.Builder
+		if block := runWorkRecordCloseGate([]string{"show", "wr-unverified"}, cityDir, cityDir, nil, nil, nil, &stderr); block != 0 {
+			t.Fatalf("non-close invocation blocked; stderr=%s", stderr.String())
+		}
+		if stderr.String() != "" {
+			t.Fatalf("non-close invocation produced gate output: %q", stderr.String())
+		}
+	})
+}
+
+// erroringGetStore fails every Get with a fixed error, simulating an
+// unhealthy or lagging read seam behind an already-open store handle.
+type erroringGetStore struct {
+	beads.Store
+	err error
+}
+
+func (s erroringGetStore) Get(string) (beads.Bead, error) { return beads.Bead{}, s.err }
+
+// TestEvaluateWorkRecordCloseGateFailsClosedOnUnreadableBead proves the
+// store.Get failure path (ga-c6sz): a close target the gate cannot read is
+// refused unless the invocation itself pins a non-pass gc.outcome. This
+// covers both a transient read error and ErrNotFound (projection lag: the
+// stamp-then-close pass form writes gc.outcome=pass through the write seam
+// moments before the close, so a lagging read seam is exactly when the pass
+// contract would otherwise be bypassed). Enforcement mode must not matter —
+// the pass contract is enforced independently of GC_WORK_RECORD_ENFORCE.
+func TestEvaluateWorkRecordCloseGateFailsClosedOnUnreadableBead(t *testing.T) {
+	readErr := errors.New("dolt read seam unavailable")
+
+	t.Run("bare close on erroring store is refused", func(t *testing.T) {
+		for _, enforce := range []bool{false, true} {
+			var stderr strings.Builder
+			block := evaluateWorkRecordCloseGate([]string{"close", "wr-lagged"}, erroringGetStore{err: readErr}, nil, t.TempDir(), enforce, &stderr) != 0
+			if !block {
+				t.Fatalf("enforce=%v: expected block=true for unreadable close target, got false; stderr=%s", enforce, stderr.String())
+			}
+			for _, want := range []string{"refusing close of wr-lagged", "dolt read seam unavailable", "retry when the beads read path is healthy"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("enforce=%v: stderr %q does not contain %q", enforce, stderr.String(), want)
+				}
+			}
+		}
+	})
+
+	t.Run("bare close on missing bead is refused", func(t *testing.T) {
+		var stderr strings.Builder
+		block := evaluateWorkRecordCloseGate([]string{"close", "wr-lagged"}, beads.NewMemStoreFrom(1, nil, nil), nil, t.TempDir(), false, &stderr) != 0
+		if !block {
+			t.Fatalf("expected block=true for close of a bead the read seam cannot see, got false; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic pass close on erroring store is refused", func(t *testing.T) {
+		args := []string{"update", "wr-lagged", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass, "--status=closed"}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, erroringGetStore{err: readErr}, nil, t.TempDir(), false, &stderr); block == 0 {
+			t.Fatalf("expected block=true for unreadable atomic pass close, got false; stderr=%s", stderr.String())
+		}
+	})
+
+	t.Run("atomic non-pass close on erroring store proceeds with a skip note", func(t *testing.T) {
+		args := []string{"update", "wr-lagged", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomeFail, "--status=closed"}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, erroringGetStore{err: readErr}, nil, t.TempDir(), false, &stderr); block != 0 {
+			t.Fatalf("non-pass close blocked on unreadable bead; stderr=%s", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "skipping validation") {
+			t.Fatalf("stderr %q does not contain the skip note", stderr.String())
+		}
+	})
+
+	t.Run("preFetched bead still bypasses the failing store", func(t *testing.T) {
+		preFetched := map[string]beads.Bead{
+			"wr-lagged": {ID: "wr-lagged", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeNoOp}},
+		}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate([]string{"close", "wr-lagged"}, erroringGetStore{err: readErr}, preFetched, t.TempDir(), false, &stderr); block != 0 {
+			t.Fatalf("valid no-op close blocked despite preFetched bead; stderr=%s", stderr.String())
+		}
+	})
+}
+
+// TestEvaluateWorkRecordCloseGateSilentFallbackKeepsLoudContract proves the
+// gate does not mask bd's silent-fallback loud-error contract (#2079/#2080):
+// when the read seam reports ErrBDSilentFallback, the close is refused with
+// bdSilentFallbackExitCode and the operator-facing message — not the generic
+// exit-1 unverifiable-close refusal — regardless of the close's argv
+// disposition, since nothing written in fallback mode persists.
+func TestEvaluateWorkRecordCloseGateSilentFallbackKeepsLoudContract(t *testing.T) {
+	fallbackErr := fmt.Errorf("getting bead %q: %w: auto-importing 220929 bytes", "wr-fb", beads.ErrBDSilentFallback)
+	shapes := map[string][]string{
+		"bare close":            {"close", "wr-fb"},
+		"atomic non-pass close": {"update", "wr-fb", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomeFail, "--status=closed"},
+		"atomic pass close":     {"update", "wr-fb", "--set-metadata", beadmeta.OutcomeMetadataKey + "=" + beadmeta.OutcomePass, "--status=closed"},
+	}
+	for name, args := range shapes {
+		t.Run(name, func(t *testing.T) {
+			var stderr strings.Builder
+			code := evaluateWorkRecordCloseGate(args, erroringGetStore{err: fallbackErr}, nil, t.TempDir(), false, &stderr)
+			if code != bdSilentFallbackExitCode {
+				t.Fatalf("code = %d, want %d (silent-fallback exit code); stderr=%s", code, bdSilentFallbackExitCode, stderr.String())
+			}
+			for _, want := range []string{"managed Dolt unreachable", "auto-importing", "close of wr-fb"} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr %q does not contain %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// TestEvaluateWorkRecordCloseGateProjectionErrorAlwaysBlocks proves a close
+// whose final metadata cannot be computed is refused independently of the
+// migration-mode enforce switch: @file metadata is the one unprojectable
+// shape bd itself accepts, so riding the warn-only default would let an
+// unverified — possibly pass — close through (ga-c6sz).
+func TestEvaluateWorkRecordCloseGateProjectionErrorAlwaysBlocks(t *testing.T) {
+	store := beads.NewMemStoreFrom(1, []beads.Bead{
+		{ID: "wr-file-pass", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}},
+		{ID: "wr-file-plain", Type: "task", Status: "in_progress", Metadata: map[string]string{}},
+	}, nil)
+	for _, id := range []string{"wr-file-pass", "wr-file-plain"} {
+		args := []string{"update", id, "--metadata", "@close.json", "--status=closed"}
+		var stderr strings.Builder
+		if block := evaluateWorkRecordCloseGate(args, store, nil, t.TempDir(), false, &stderr); block == 0 {
+			t.Fatalf("close of %s with unprojectable metadata not blocked in warn-only mode; stderr=%s", id, stderr.String())
+		}
+		for _, want := range []string{"cannot project --metadata", "refusing close of " + id} {
+			if !strings.Contains(stderr.String(), want) {
+				t.Fatalf("stderr %q does not contain %q", stderr.String(), want)
+			}
+		}
 	}
 }
 
@@ -753,7 +988,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ok"}, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ok"}, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("clean pass close blocked; stderr=%s", stderr.String())
 		}
 		if strings.Contains(stderr.String(), "pass-close gate") {
@@ -771,7 +1006,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-nocommit"}, store, nil, repoDir, false, &stderr); !block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-nocommit"}, store, nil, repoDir, false, &stderr); block == 0 {
 			t.Fatalf("pass close without commit not blocked; stderr=%s", stderr.String())
 		}
 		for _, want := range []string{"pass-close gate", "requires " + beadmeta.WorkCommitMetadataKey, "commit the work"} {
@@ -798,7 +1033,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-detached"}, store, nil, repoDir, false, &stderr); !block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-detached"}, store, nil, repoDir, false, &stderr); block == 0 {
 			t.Fatalf("detached-HEAD pass close not blocked; stderr=%s", stderr.String())
 		}
 		if !strings.Contains(stderr.String(), "not reachable from any branch") {
@@ -816,7 +1051,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-bogus"}, store, nil, repoDir, false, &stderr); !block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-bogus"}, store, nil, repoDir, false, &stderr); block == 0 {
 			t.Fatalf("bogus-commit pass close not blocked; stderr=%s", stderr.String())
 		}
 		if !strings.Contains(stderr.String(), "does not exist") {
@@ -837,7 +1072,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-dirty"}, store, nil, repoDir, false, &stderr); !block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-dirty"}, store, nil, repoDir, false, &stderr); block == 0 {
 			t.Fatalf("dirty-tree pass close not blocked; stderr=%s", stderr.String())
 		}
 		if !strings.Contains(stderr.String(), "artifact.txt") {
@@ -868,7 +1103,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-untracked"}, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-untracked"}, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("untracked-only dirt blocked the close; stderr=%s", stderr.String())
 		}
 	})
@@ -885,7 +1120,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			"--status=closed",
 		}
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("typed no-op pass close blocked; stderr=%s", stderr.String())
 		}
 	})
@@ -908,7 +1143,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-infra"}, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-infra"}, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("infrastructure-only dirt blocked the close; stderr=%s", stderr.String())
 		}
 	})
@@ -935,7 +1170,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ignored"}, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-ignored"}, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("gitignored dirt blocked the close; stderr=%s", stderr.String())
 		}
 	})
@@ -950,7 +1185,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			},
 		}}, nil)
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-control"}, store, nil, repoDir, false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate([]string{"close", "pc-control"}, store, nil, repoDir, false, &stderr); block != 0 {
 			t.Fatalf("control bead pass close blocked; stderr=%s", stderr.String())
 		}
 	})
@@ -966,7 +1201,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			"--status=closed",
 		}
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); !block {
+		if block := evaluateWorkRecordCloseGate(args, store, nil, repoDir, false, &stderr); block == 0 {
 			t.Fatalf("atomic pass close without commit not blocked; stderr=%s", stderr.String())
 		}
 	})
@@ -984,7 +1219,7 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 			"--status=closed",
 		}
 		var stderr strings.Builder
-		if block := evaluateWorkRecordCloseGate(args, store, nil, t.TempDir(), false, &stderr); block {
+		if block := evaluateWorkRecordCloseGate(args, store, nil, t.TempDir(), false, &stderr); block != 0 {
 			t.Fatalf("valid atomic pass close blocked; stderr=%s", stderr.String())
 		}
 	})
