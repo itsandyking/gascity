@@ -109,33 +109,318 @@ func TestValidateWorkRecordOnClose(t *testing.T) {
 }
 
 func TestIsWorkRecordGatedBead(t *testing.T) {
+	corroborated := func(beads.Bead) bool { return true }
+	uncorroborated := func(beads.Bead) bool { return false }
 	tests := []struct {
-		name string
-		bead beads.Bead
-		want bool
+		name        string
+		bead        beads.Bead
+		corroborate teardownCorroborator
+		want        bool
 	}{
 		{name: "plain task bead is gated", bead: beads.Bead{Type: "task"}, want: true},
 		{name: "empty type defaults to gated", bead: beads.Bead{}, want: true},
 		{
-			name: "workflow root is not gated",
-			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}},
+			name: "graph workflow root with recipe identity is not gated",
+			bead: beads.Bead{
+				Type: "task",
+				Ref:  "mol-demo",
+				Metadata: map[string]string{
+					beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+					beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+				},
+			},
 			want: false,
 		},
 		{
-			name: "control run step is not gated",
-			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindRun}},
+			name: "controller-routed run marker is not gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:     beadmeta.KindRun,
+				beadmeta.RoutedToMetadataKey: "gascity/control-dispatcher",
+			}},
+			want: false,
+		},
+		{
+			name: "bare controller kind is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCheck}},
+			want: true,
+		},
+		{
+			name: "structured scope latch is not gated",
+			bead: beads.Bead{
+				Type: "task",
+				Ref:  "step.iteration.1",
+				Metadata: map[string]string{
+					beadmeta.KindMetadataKey:       beadmeta.KindScope,
+					beadmeta.RootBeadIDMetadataKey: "wf-root",
+					beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleBody,
+					beadmeta.ControlForMetadataKey: "step",
+					beadmeta.StepRefMetadataKey:    "step.iteration.1",
+				},
+			},
 			want: false,
 		},
 		{name: "convoy bead is not gated", bead: beads.Bead{Type: "convoy"}, want: false},
 		{name: "message bead is not gated", bead: beads.Bead{Type: "message"}, want: false},
+		{name: "molecule rollup container is not gated", bead: beads.Bead{Type: "molecule"}, want: false},
+		{name: "epic rollup is not gated", bead: beads.Bead{Type: "epic"}, want: false},
+		{
+			name: "control-dispatcher lane route keeps a control kind exempt",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:     beadmeta.KindFanout,
+				beadmeta.RoutedToMetadataKey: "gascity/control-dispatcher",
+			}},
+			want: false,
+		},
+		{
+			name: "legacy workflow-control route keeps a control kind exempt",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:     beadmeta.KindScopeCheck,
+				beadmeta.RoutedToMetadataKey: "gascity/workflow-control",
+			}},
+			want: false,
+		},
+		{
+			name: "gc.kind=task attempt work is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindTask}},
+			want: true,
+		},
+		{
+			name: "arbitrary gc.kind is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: "totally-real-bookkeeping"}},
+			want: true,
+		},
+		{
+			name: "control kind on a session-claimed bead is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:      beadmeta.KindCheck,
+				beadmeta.SessionIDMetadataKey: "mc-1234",
+			}},
+			want: true,
+		},
+		{
+			name: "control kind on a directly assigned bead is gated",
+			bead: beads.Bead{
+				Type:     "task",
+				Assignee: "gascity/gc.implementation-worker",
+				Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCheck},
+			},
+			want: true,
+		},
+		{
+			name: "control route with a stale worker assignment is gated",
+			bead: beads.Bead{
+				Type:     "task",
+				Assignee: "gascity/gc.implementation-worker",
+				Metadata: map[string]string{
+					beadmeta.KindMetadataKey:     beadmeta.KindCheck,
+					beadmeta.RoutedToMetadataKey: "gascity/control-dispatcher",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "control kind with worker provenance is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:        beadmeta.KindDrain,
+				beadmeta.WorkerGenusMetadataKey: "anthropic",
+			}},
+			want: true,
+		},
+		{
+			name: "control kind routed to a worker template is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:     beadmeta.KindWorkflowFinalize,
+				beadmeta.RoutedToMetadataKey: "gascity/gc.implementation-worker",
+			}},
+			want: true,
+		},
+		{
+			name: "workflow kind on a session-claimed bead is gated",
+			bead: beads.Bead{Type: "task", Ref: "mol-demo", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+				beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+				beadmeta.SessionNameMetadataKey:     "gc__implementation-worker-mc-1",
+			}},
+			want: true,
+		},
+		{
+			name: "corroborated cleanup teardown is not gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:      beadmeta.KindCleanup,
+				beadmeta.SessionIDMetadataKey: "mc-1234",
+			}},
+			corroborate: corroborated,
+			want:        false,
+		},
+		{
+			name: "corroborated scope-role teardown attempt is not gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:      beadmeta.KindTask,
+				beadmeta.ScopeRoleMetadataKey: beadmeta.ScopeRoleTeardown,
+			}},
+			corroborate: corroborated,
+			want:        false,
+		},
+		{
+			name: "uncorroborated cleanup claim is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{
+				beadmeta.KindMetadataKey:      beadmeta.KindCleanup,
+				beadmeta.SessionIDMetadataKey: "mc-1234",
+			}},
+			corroborate: uncorroborated,
+			want:        true,
+		},
+		{
+			name: "cleanup claim with no corroborator is gated",
+			bead: beads.Bead{Type: "task", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCleanup}},
+			want: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isWorkRecordGatedBead(tc.bead); got != tc.want {
+			if got := isWorkRecordGatedBead(tc.bead, tc.corroborate); got != tc.want {
 				t.Fatalf("isWorkRecordGatedBead = %v, want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+// TestIsControllerOwnedBookkeepingKind pins the candidate kind vocabulary.
+// Membership alone is not the exemption; shape is tested above.
+func TestIsControllerOwnedBookkeepingKind(t *testing.T) {
+	var owned []string
+	owned = append(owned, beadmeta.ControlKinds...)
+	owned = append(owned,
+		beadmeta.KindWorkflow, beadmeta.KindScope, beadmeta.KindSpec,
+		beadmeta.KindRun, beadmeta.KindRetryRun, beadmeta.KindWisp, beadmeta.KindClosed)
+	for _, kind := range owned {
+		if !isControllerOwnedBookkeepingKind(kind) {
+			t.Errorf("isControllerOwnedBookkeepingKind(%q) = false, want true", kind)
+		}
+	}
+	for _, kind := range []string{"", beadmeta.KindTask, beadmeta.KindCleanup, "banana", "Check", "cleanup-x"} {
+		if isControllerOwnedBookkeepingKind(kind) {
+			t.Errorf("isControllerOwnedBookkeepingKind(%q) = true, want false", kind)
+		}
+	}
+}
+
+// TestIsCorroboratedTeardownBead covers the store-backed terminal-teardown
+// check both ways: the genuine drain shape stays exempt, and a mid-molecule
+// work step that stamps itself gc.kind=cleanup fails because work remains open.
+func TestIsCorroboratedTeardownBead(t *testing.T) {
+	const rootID = "wf-root"
+	root := beads.Bead{ID: rootID, Type: "task", Ref: "mol-demo", Status: "in_progress", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		beadmeta.RootBeadIDMetadataKey:      rootID,
+	}}
+	closedWork := beads.Bead{ID: "wf-do-work", Type: "task", Status: "closed", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey: rootID,
+	}}
+	openWork := beads.Bead{ID: "wf-do-work-open", Type: "task", Status: "in_progress", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey: rootID,
+	}}
+	finalize := beads.Bead{ID: "wf-finalize", Type: "task", Status: "open", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
+		beadmeta.RootBeadIDMetadataKey: rootID,
+		beadmeta.RoutedToMetadataKey:   "gascity/control-dispatcher",
+	}}
+	drain := beads.Bead{ID: "wf-drain", Type: "task", Status: "in_progress", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:       beadmeta.KindCleanup,
+		beadmeta.RootBeadIDMetadataKey: rootID,
+		beadmeta.SessionIDMetadataKey:  "mc-1",
+	}}
+	openDrain := beads.Bead{ID: "wf-drain-open", Type: "task", Status: "open", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:       beadmeta.KindCleanup,
+		beadmeta.RootBeadIDMetadataKey: rootID,
+	}}
+
+	t.Run("terminal drain under a live workflow root is corroborated", func(t *testing.T) {
+		store := beads.NewMemStoreFrom(1, []beads.Bead{root, closedWork, finalize, drain}, nil)
+		if !isCorroboratedTeardownBead(store, drain) {
+			t.Fatal("expected the terminal drain step to be corroborated")
+		}
+	})
+	t.Run("teardown attempt bead with scope role is corroborated", func(t *testing.T) {
+		attempt := beads.Bead{ID: "wf-teardown-attempt", Type: "task", Ref: "step.teardown", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindTask,
+			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleTeardown,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+		}}
+		retryControl := beads.Bead{ID: "wf-retry", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindRetry,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+			beadmeta.RoutedToMetadataKey:   "gascity/control-dispatcher",
+		}}
+		scopeLatch := beads.Bead{ID: "wf-scope", Type: "task", Ref: "step", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindScope,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleBody,
+			beadmeta.ControlForMetadataKey: "step",
+			beadmeta.StepRefMetadataKey:    "step",
+		}}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{root, closedWork, finalize, retryControl, scopeLatch, attempt}, nil)
+		if !isCorroboratedTeardownBead(store, attempt) {
+			t.Fatal("expected the teardown attempt bead to be corroborated")
+		}
+	})
+	t.Run("open work sibling defeats corroboration", func(t *testing.T) {
+		spoofed := beads.Bead{ID: "wf-spoofed", Type: "task", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindCleanup,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+		}}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{root, spoofed, openDrain}, nil)
+		if isCorroboratedTeardownBead(store, spoofed) {
+			t.Fatal("a cleanup claim with the real teardown still open must not be corroborated")
+		}
+	})
+	t.Run("open unknown-kind sibling defeats corroboration", func(t *testing.T) {
+		store := beads.NewMemStoreFrom(1, []beads.Bead{root, openWork, drain}, nil)
+		if isCorroboratedTeardownBead(store, drain) {
+			t.Fatal("open work under the root must defeat corroboration")
+		}
+	})
+	t.Run("missing root linkage fails", func(t *testing.T) {
+		orphan := beads.Bead{ID: "wf-orphan", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey: beadmeta.KindCleanup,
+		}}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{root, orphan}, nil)
+		if isCorroboratedTeardownBead(store, orphan) {
+			t.Fatal("a teardown claim without root linkage must not be corroborated")
+		}
+	})
+	t.Run("self-referential root linkage fails", func(t *testing.T) {
+		selfRoot := beads.Bead{ID: "wf-self", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindCleanup,
+			beadmeta.RootBeadIDMetadataKey: "wf-self",
+		}}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{selfRoot}, nil)
+		if isCorroboratedTeardownBead(store, selfRoot) {
+			t.Fatal("a bead naming itself as root must not be corroborated")
+		}
+	})
+	t.Run("dangling root fails", func(t *testing.T) {
+		store := beads.NewMemStoreFrom(1, []beads.Bead{drain}, nil)
+		if isCorroboratedTeardownBead(store, drain) {
+			t.Fatal("a dangling root reference must not be corroborated")
+		}
+	})
+	t.Run("closed root fails", func(t *testing.T) {
+		closedRoot := root
+		closedRoot.Status = "closed"
+		store := beads.NewMemStoreFrom(1, []beads.Bead{closedRoot, drain}, nil)
+		if isCorroboratedTeardownBead(store, drain) {
+			t.Fatal("a closed root must not corroborate a teardown claim")
+		}
+	})
+	t.Run("non-workflow root fails", func(t *testing.T) {
+		taskRoot := beads.Bead{ID: rootID, Type: "task", Status: "open", Metadata: map[string]string{}}
+		store := beads.NewMemStoreFrom(1, []beads.Bead{taskRoot, drain}, nil)
+		if isCorroboratedTeardownBead(store, drain) {
+			t.Fatal("a non-workflow root must not corroborate a teardown claim")
+		}
+	})
 }
 
 func TestValidWorkOutcome(t *testing.T) {
@@ -196,7 +481,10 @@ func TestEvaluateWorkRecordCloseGate(t *testing.T) {
 		{ID: "wr-noop", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeNoOp}},
 		{ID: "wr-atomic-noop", Type: "task", Status: "in_progress", Metadata: map[string]string{}},
 		{ID: "wr-missing", Type: "task", Status: "in_progress", Metadata: map[string]string{}},
-		{ID: "wr-control", Type: "task", Status: "in_progress", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}},
+		{ID: "wr-control", Type: "task", Ref: "mol-demo", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		}},
 	}
 	newStore := func() beads.Store { return beads.NewMemStoreFrom(1, beadsList, nil) }
 
@@ -336,6 +624,126 @@ func TestEvaluateWorkRecordCloseGate(t *testing.T) {
 			}
 			if !strings.Contains(out, tc.wantWarn) {
 				t.Fatalf("gate output %q does not contain %q", out, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// TestEvaluateWorkRecordCloseGateKindSpoof is the ga-w25b regression: a
+// worker-claimable task cannot shed either close gate merely by carrying
+// arbitrary, task, control, or cleanup gc.kind metadata. The atomic form also
+// proves that stamping cleanup in the same update as close cannot change the
+// classification performed on the stored bead.
+func TestEvaluateWorkRecordCloseGateKindSpoof(t *testing.T) {
+	const rootID = "wf-root"
+	worked := func(id, kind string, extra map[string]string) beads.Bead {
+		metadata := map[string]string{
+			beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+			beadmeta.SessionIDMetadataKey:   "mc-spoof",
+			beadmeta.SessionNameMetadataKey: "gc__implementation-worker-mc-spoof",
+			beadmeta.RoutedToMetadataKey:    "gascity/gc.implementation-worker",
+		}
+		if kind != "" {
+			metadata[beadmeta.KindMetadataKey] = kind
+		}
+		for k, v := range extra {
+			metadata[k] = v
+		}
+		return beads.Bead{ID: id, Type: "task", Status: "in_progress", Metadata: metadata}
+	}
+	beadsList := []beads.Bead{
+		{ID: rootID, Type: "task", Ref: "mol-demo", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		}},
+		{ID: "wf-real-drain", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindCleanup,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+		}},
+		worked("spoof-arbitrary", "totally-real-bookkeeping", nil),
+		worked("spoof-task-kind", beadmeta.KindTask, nil),
+		worked("spoof-control", beadmeta.KindCheck, nil),
+		worked("spoof-cleanup", beadmeta.KindCleanup, map[string]string{beadmeta.RootBeadIDMetadataKey: rootID}),
+		worked("spoof-atomic", "", nil),
+	}
+	closes := [][]string{
+		{"close", "spoof-arbitrary"},
+		{"close", "spoof-task-kind"},
+		{"close", "spoof-control"},
+		{"close", "spoof-cleanup"},
+		{"update", "spoof-atomic", "--set-metadata", beadmeta.KindMetadataKey + "=" + beadmeta.KindCleanup, "--status=closed"},
+	}
+	for _, args := range closes {
+		t.Run(strings.Join(args[:2], " "), func(t *testing.T) {
+			store := beads.NewMemStoreFrom(1, beadsList, nil)
+			var stderr strings.Builder
+			if code := evaluateWorkRecordCloseGate(args, store, nil, t.TempDir(), false, &stderr); code != 1 {
+				t.Fatalf("exit code = %d, want 1 (blocked); stderr=%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "pass-close gate") {
+				t.Fatalf("expected a pass-close refusal, got %q", stderr.String())
+			}
+		})
+	}
+}
+
+// TestEvaluateWorkRecordCloseGateTeardownBookkeeping proves the genuine
+// bookkeeping close shapes stay exempt end to end: corroborated mol-do-work
+// and scoped teardown steps, plus convoy, message, and rollup containers, can
+// close gc.outcome=pass without a work commit under enforcement.
+func TestEvaluateWorkRecordCloseGateTeardownBookkeeping(t *testing.T) {
+	const rootID = "wf-root"
+	const attemptRootID = "wf-root-2"
+	beadsList := []beads.Bead{
+		{ID: rootID, Type: "task", Ref: "mol-demo", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		}},
+		{ID: "wf-do-work", Type: "task", Status: "closed", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: rootID}},
+		{ID: "wf-finalize", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
+			beadmeta.RootBeadIDMetadataKey: rootID,
+			beadmeta.RoutedToMetadataKey:   "gascity/control-dispatcher",
+		}},
+		{ID: "wf-drain", Type: "task", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:        beadmeta.KindCleanup,
+			beadmeta.RootBeadIDMetadataKey:  rootID,
+			beadmeta.OutcomeMetadataKey:     beadmeta.OutcomePass,
+			beadmeta.SessionIDMetadataKey:   "mc-drain",
+			beadmeta.SessionNameMetadataKey: "gc__implementation-worker-mc-drain",
+			beadmeta.RoutedToMetadataKey:    "gascity/gc.implementation-worker",
+			beadmeta.WorkerGenusMetadataKey: "anthropic",
+		}},
+		{ID: attemptRootID, Type: "task", Ref: "mol-attempt", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+			beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		}},
+		{ID: "wf2-body", Type: "task", Status: "closed", Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: attemptRootID}},
+		{ID: "wf2-retry", Type: "task", Status: "open", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindRetry,
+			beadmeta.RootBeadIDMetadataKey: attemptRootID,
+			beadmeta.RoutedToMetadataKey:   "gascity/control-dispatcher",
+		}},
+		{ID: "wf-teardown-attempt", Type: "task", Ref: "step.teardown", Status: "in_progress", Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindTask,
+			beadmeta.ScopeRoleMetadataKey:  beadmeta.ScopeRoleTeardown,
+			beadmeta.RootBeadIDMetadataKey: attemptRootID,
+			beadmeta.OutcomeMetadataKey:    beadmeta.OutcomePass,
+			beadmeta.SessionIDMetadataKey:  "mc-attempt",
+		}},
+		{ID: "convoy-1", Type: "convoy", Status: "open", Metadata: map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}},
+		{ID: "mail-1", Type: "message", Status: "open"},
+		{ID: "rollup-1", Type: "molecule", Status: "open", Metadata: map[string]string{beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass}},
+	}
+	for _, id := range []string{"wf-drain", "wf-teardown-attempt", "convoy-1", "mail-1", "rollup-1"} {
+		t.Run(id, func(t *testing.T) {
+			store := beads.NewMemStoreFrom(1, beadsList, nil)
+			var stderr strings.Builder
+			if code := evaluateWorkRecordCloseGate([]string{"close", id}, store, nil, t.TempDir(), true, &stderr); code != 0 {
+				t.Fatalf("exit code = %d, want 0 (proceed); stderr=%s", code, stderr.String())
+			}
+			if out := stderr.String(); out != "" {
+				t.Fatalf("expected no gate output for bookkeeping close, got %q", out)
 			}
 		})
 	}
@@ -1180,8 +1588,9 @@ func TestEvaluateWorkRecordCloseGatePassClose(t *testing.T) {
 		store := beads.NewMemStoreFrom(1, []beads.Bead{{
 			ID: "pc-control", Type: "task", Status: "in_progress",
 			Metadata: map[string]string{
-				beadmeta.KindMetadataKey:    beadmeta.KindCheck,
-				beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
+				beadmeta.KindMetadataKey:     beadmeta.KindCheck,
+				beadmeta.RoutedToMetadataKey: "gascity/control-dispatcher",
+				beadmeta.OutcomeMetadataKey:  beadmeta.OutcomePass,
 			},
 		}}, nil)
 		var stderr strings.Builder

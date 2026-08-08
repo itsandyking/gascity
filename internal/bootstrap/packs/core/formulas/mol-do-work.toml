@@ -157,6 +157,10 @@ gc runtime drain-ack
 Run exactly these commands and nothing else."""
 # gc.kind=cleanup marks this step as teardown bookkeeping, not a work unit:
 # it is routed to the worker like any step, but the work-record and
-# pass-close gates exempt kind-carrying beads, so closing it with
-# gc.outcome=pass demands no gc.work_commit (ga-vx36).
+# pass-close gates exempt corroborated teardown steps, so closing it with
+# gc.outcome=pass demands no gc.work_commit (ga-vx36). The exemption is not
+# taken on faith from this metadata alone: the close gate verifies the
+# terminal-teardown shape against the store — a live workflow root with no
+# work left open under it — so stamping gc.kind=cleanup onto a real work
+# bead does not shed the gate (ga-w25b).
 metadata = { "gc.kind" = "cleanup" }

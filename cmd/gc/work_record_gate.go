@@ -78,17 +78,164 @@ func validWorkOutcome(v string) bool {
 	}
 }
 
+// Both close contracts scope to worker-claimable work through
+// isWorkRecordGatedBead. gc.kind alone proves nothing: it is mutable metadata
+// with no provenance, so each bookkeeping exemption requires either a
+// controller route, a task-shaped topology identity, or a non-task bead type.
+// Worker-executed teardown is corroborated against the store before it is
+// exempted; a real work bead cannot shed the gate by stamping gc.kind=cleanup.
+
+// teardownCorroborator confirms a teardown-shaped bead's bookkeeping claim
+// against the store. A nil corroborator means the claim cannot be checked and
+// therefore remains gated.
+type teardownCorroborator func(bead beads.Bead) bool
+
 // isWorkRecordGatedBead reports whether the work-record close contract applies
-// to bead. It applies to worker-claimable work units — plain task beads — and
-// deliberately NOT to control/structural beads (anything carrying gc.kind:
-// workflow roots, scope/run/check/drain steps, etc.) or non-task beads (convoy,
-// message). Those use the disjoint control-plane gc.outcome vocabulary and are
-// closed by the dispatch engine, not by a worker reporting a work outcome.
-func isWorkRecordGatedBead(bead beads.Bead) bool {
+// to bead. It applies to worker-claimable work units and deliberately NOT to
+// engine bookkeeping, which uses the disjoint control-plane gc.outcome
+// vocabulary and ships no work artifact.
+func isWorkRecordGatedBead(bead beads.Bead, corroborate teardownCorroborator) bool {
 	if t := strings.TrimSpace(bead.Type); t != "" && t != "task" {
 		return false
 	}
-	if strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]) != "" {
+	if isControllerOwnedBookkeepingBead(bead) {
+		return false
+	}
+	if isTeardownShapedBead(bead) && corroborate != nil && corroborate(bead) {
+		return false
+	}
+	return true
+}
+
+// isControllerOwnedBookkeepingKind reports whether a gc.kind value names
+// engine bookkeeping: the control-dispatcher kinds plus structural and
+// topology values kept for graph/v1 compatibility. The value is only a
+// candidate classification; isControllerOwnedBookkeepingBead requires the
+// authoritative route or topology shape before exempting a task bead.
+func isControllerOwnedBookkeepingKind(kind string) bool {
+	if beadmeta.IsControlKind(kind) {
+		return true
+	}
+	switch kind {
+	case beadmeta.KindWorkflow, beadmeta.KindScope, beadmeta.KindSpec,
+		beadmeta.KindRun, beadmeta.KindRetryRun, beadmeta.KindWisp, beadmeta.KindClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+// isControllerOwnedBookkeepingBead reports whether bead has enough shape to be
+// controller bookkeeping rather than worker work. A control kind needs a
+// control-dispatcher route. Task-shaped workflow and scope topology nodes need
+// their recipe identity and structural metadata. Claim stamps and an assignee
+// are negative evidence even when a stale controller route remains.
+func isControllerOwnedBookkeepingBead(bead beads.Bead) bool {
+	if t := strings.TrimSpace(bead.Type); t != "" && t != "task" {
+		return true
+	}
+	kind := strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])
+	if !isControllerOwnedBookkeepingKind(kind) || hasWorkerClaimStamps(bead) || strings.TrimSpace(bead.Assignee) != "" {
+		return false
+	}
+	route := strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey])
+	if route != "" {
+		return isControlDispatcherLaneRoute(route)
+	}
+
+	switch kind {
+	case beadmeta.KindWorkflow:
+		return strings.TrimSpace(bead.Ref) != "" &&
+			strings.TrimSpace(bead.Metadata[beadmeta.FormulaContractMetadataKey]) == beadmeta.FormulaContractGraphV2 &&
+			strings.TrimSpace(bead.ParentID) == ""
+	case beadmeta.KindScope:
+		return strings.TrimSpace(bead.Ref) != "" &&
+			strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey]) != "" &&
+			strings.TrimSpace(bead.Metadata[beadmeta.ScopeRoleMetadataKey]) == beadmeta.ScopeRoleBody &&
+			strings.TrimSpace(bead.Metadata[beadmeta.ControlForMetadataKey]) != "" &&
+			strings.TrimSpace(bead.Metadata[beadmeta.StepRefMetadataKey]) != ""
+	default:
+		return false
+	}
+}
+
+// workerClaimStampKeys are the metadata keys the claim path stamps onto every
+// session-claimed non-control bead: session identity plus worker provenance.
+// Their presence is claim-time evidence the bead was handed to a worker,
+// whatever its current gc.kind claims.
+var workerClaimStampKeys = []string{
+	beadmeta.SessionIDMetadataKey,
+	beadmeta.SessionNameMetadataKey,
+	beadmeta.WorkerModelMetadataKey,
+	beadmeta.WorkerGenusMetadataKey,
+	beadmeta.WorkerEffortMetadataKey,
+}
+
+// hasWorkerClaimStamps reports whether bead carries any claim-time worker
+// identity.
+func hasWorkerClaimStamps(bead beads.Bead) bool {
+	for _, key := range workerClaimStampKeys {
+		if strings.TrimSpace(bead.Metadata[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// legacyControlLaneName is the pre-rename control dispatcher tail still
+// present on persisted beads.
+const legacyControlLaneName = "workflow-control"
+
+// isControlDispatcherLaneRoute reports whether route targets the implicit
+// control-dispatcher lane rather than a worker agent.
+func isControlDispatcherLaneRoute(route string) bool {
+	if route == config.ControlDispatcherAgentName || route == legacyControlLaneName {
+		return true
+	}
+	return strings.HasSuffix(route, "/"+config.ControlDispatcherAgentName) ||
+		strings.HasSuffix(route, "/"+legacyControlLaneName)
+}
+
+// isTeardownShapedBead reports whether bead claims the worker-executed
+// teardown shape used by mol-do-work and scoped retry attempts.
+func isTeardownShapedBead(bead beads.Bead) bool {
+	return strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey]) == beadmeta.KindCleanup ||
+		strings.TrimSpace(bead.Metadata[beadmeta.ScopeRoleMetadataKey]) == beadmeta.ScopeRoleTeardown
+}
+
+// isCorroboratedTeardownBead verifies a teardown claim against the store: the
+// bead must point at a live workflow root and no open non-bookkeeping work may
+// remain under that root. A worker stamping cleanup onto a mid-molecule bead
+// therefore fails closed while the genuine terminal drain remains exempt.
+func isCorroboratedTeardownBead(store beads.Store, bead beads.Bead) bool {
+	if store == nil {
+		return false
+	}
+	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" || rootID == bead.ID {
+		return false
+	}
+	root, err := store.Get(rootID)
+	if err != nil || root.Status == "closed" {
+		return false
+	}
+	if strings.TrimSpace(root.Metadata[beadmeta.KindMetadataKey]) != beadmeta.KindWorkflow {
+		return false
+	}
+	siblings, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		return false
+	}
+	for _, sibling := range siblings {
+		if sibling.ID == bead.ID || sibling.ID == rootID || sibling.Status == "closed" {
+			continue
+		}
+		if isControllerOwnedBookkeepingBead(sibling) {
+			continue
+		}
 		return false
 	}
 	return true
@@ -542,7 +689,7 @@ func evaluateWorkRecordCloseGate(bdArgs []string, store beads.Store, preFetched 
 				continue
 			}
 		}
-		if !isWorkRecordGatedBead(bead) {
+		if !isWorkRecordGatedBead(bead, func(b beads.Bead) bool { return isCorroboratedTeardownBead(store, b) }) {
 			continue
 		}
 		var projectionErr error
