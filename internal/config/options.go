@@ -145,6 +145,22 @@ func ResolveExplicitOptions(schema []ProviderOption, overrides map[string]string
 	return extraArgs, nil
 }
 
+// InferOptionDefaultsFromCommand reports the schema option choices explicitly
+// present in command (a full launch command line, e.g. a session bead's stored
+// resolved command), keyed by OptionsSchema key with the matched choice's
+// Value. Only declared FlagArgs/FlagAliases sequences match — undeclared flags
+// are ignored, and an absent option is simply missing from the result, so
+// callers can layer the result over EffectiveDefaults to recover the launch's
+// effective choices. The result is never nil.
+func InferOptionDefaultsFromCommand(schema []ProviderOption, command string) map[string]string {
+	inferred := make(map[string]string)
+	if strings.TrimSpace(command) == "" || len(schema) == 0 {
+		return inferred
+	}
+	inferChoicesFromArgs(schema, shellquote.Split(command), inferred)
+	return inferred
+}
+
 func completeResumeCommandDefaults(command, resumeFlag, resumeStyle string, schema []ProviderOption, effectiveDefaults map[string]string) string {
 	if strings.TrimSpace(command) == "" || len(schema) == 0 || len(effectiveDefaults) == 0 {
 		return command

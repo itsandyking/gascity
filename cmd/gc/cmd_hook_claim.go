@@ -41,6 +41,11 @@ type hookClaimOptions struct {
 	Env                []string
 	DrainAck           bool
 	JSON               bool
+	// Worker is the claiming session's resolved execution provenance
+	// (worker_model / worker_genus / worker_effort), stamped onto claimed
+	// work beads alongside the session back-reference so the cross-genus
+	// review policy can verify executor lineage on every dispatch route.
+	Worker workerProvenance
 }
 
 type hookClaimOps struct {
@@ -592,14 +597,17 @@ func stampHookClaimIdentity(bead beads.Bead, opts hookClaimOptions, ops hookClai
 
 // hookClaimIdentityPatch builds the compare-and-skipped claim-time metadata patch.
 // It carries gc.work_branch when the worktree resolves a branch that differs from
-// the bead's, and the session back-reference gc.session_id / gc.session_name when
-// this is a session-run claim (GC_SESSION_ID present) of a non-control bead and the
-// values differ. Session identity is stamped even when the branch is empty — a
-// session with no worktree still needs its back-reference — but never on control
-// beads, which stay session-free by graphroute's design
-// (ApplyGraphControlRouteBinding), even when a control-dispatcher session claims one
-// through this same hook path. An empty result means every key is already current,
-// so the caller issues no write.
+// the bead's, and — when this is a session-run claim (GC_SESSION_ID present) of a
+// non-control bead — the session back-reference gc.session_id / gc.session_name
+// plus the worker provenance triple worker_model / worker_genus / worker_effort
+// (opts.Worker, ga-vkcp) for whichever values differ. Session identity and
+// provenance are stamped even when the branch is empty — a session with no
+// worktree still needs its back-reference — but never on control beads, which
+// stay session-free by graphroute's design (ApplyGraphControlRouteBinding), even
+// when a control-dispatcher session claims one through this same hook path; a
+// control step is infrastructure, not a worker whose lineage the cross-genus gate
+// reviews. Empty provenance fields stay unstamped (unknown, not fabricated). An
+// empty result means every key is already current, so the caller issues no write.
 func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) map[string]string {
 	patch := map[string]string{}
 	if branch := strings.TrimSpace(ops.ResolveWorkBranch(dir)); branch != "" &&
@@ -614,6 +622,15 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 		if sessionName := hookClaimSessionName(opts.Env); sessionName != "" &&
 			strings.TrimSpace(bead.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 			patch[beadmeta.SessionNameMetadataKey] = sessionName
+		}
+		for key, value := range map[string]string{
+			beadmeta.WorkerModelMetadataKey:  strings.TrimSpace(opts.Worker.Model),
+			beadmeta.WorkerGenusMetadataKey:  strings.TrimSpace(opts.Worker.Genus),
+			beadmeta.WorkerEffortMetadataKey: strings.TrimSpace(opts.Worker.Effort),
+		} {
+			if value != "" && strings.TrimSpace(bead.Metadata[key]) != value {
+				patch[key] = value
+			}
 		}
 	}
 	return patch

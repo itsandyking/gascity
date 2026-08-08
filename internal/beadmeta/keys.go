@@ -256,6 +256,36 @@ const (
 	LegacyWorkDirMetadataKey = "work_dir"
 )
 
+// Worker-provenance metadata keys: a non-"gc."-prefixed sibling family (like
+// the directory keys above) stamped onto claimed work beads by the gc hook
+// --claim identity stamp, recording WHICH executor lineage worked the bead.
+// The bare names match the cross-genus review vocabulary already carried by
+// conductor-loop-worked beads (worker_model/worker_genus/worker_effort), so
+// one query answers "who worked this" across both dispatch worlds. The
+// cross-genus review policy needs these on EVERY worked bead: a reviewer lane
+// cannot verify its genus differs from the implementer's if the implementer
+// genus was never recorded.
+//
+//   - WorkerGenusMetadataKey ("worker_genus") — the model training lineage
+//     (e.g. "anthropic", "openai", "google"), derived from the session
+//     provider's builtin family; multi-model router families fall back to the
+//     family name itself, which still differs from every single-lineage genus
+//     so cross-genus comparisons stay sound.
+//   - WorkerModelMetadataKey ("worker_model") — the session's effective model
+//     choice value when known (launch-command-inferred, else the resolved
+//     provider's effective default). Omitted when the provider CLI picks its
+//     own default model that gc never sees.
+//   - WorkerEffortMetadataKey ("worker_effort") — the session's effective
+//     reasoning-effort choice value, same resolution as the model.
+//
+// Not in KnownMetadataKeys: the drift guard's key-shape rule only covers the
+// gc. namespace.
+const (
+	WorkerEffortMetadataKey = "worker_effort"
+	WorkerGenusMetadataKey  = "worker_genus"
+	WorkerModelMetadataKey  = "worker_model"
+)
+
 // Dispatch metadata keys: a non-"gc."-prefixed family that sling writes onto
 // work and source beads to wire molecules together and record the merge
 // strategy. They predate the gc. namespace convention and their on-store

@@ -296,11 +296,16 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	// identity from the environment; it is a no-op for a non-session runtime (no
 	// GC_SESSION_ID / GC_INSTANCE_TOKEN) and fails open for an eligible session or a
 	// transient session-store fault, so a healthy worker still falls through to the
-	// suspension and config checks below.
+	// suspension and config checks below. An eligible session's loaded bead rides
+	// along as claimSessionInfo so the claim-time provenance stamp reuses the
+	// fence's read instead of issuing another.
+	var claimSessionInfo *session.Info
 	if opts.Claim {
-		if code, handled := fenceHookClaimSession(cityPath, cfg, strings.TrimSpace(os.Getenv("GC_SESSION_ID")), opts, stdout, stderr); handled {
+		code, handled, info := fenceHookClaimSession(cityPath, cfg, strings.TrimSpace(os.Getenv("GC_SESSION_ID")), opts, stdout, stderr)
+		if handled {
 			return code
 		}
+		claimSessionInfo = info
 	}
 
 	st, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
@@ -475,6 +480,7 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			Env:          queryEnv,
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
+			Worker:       hookWorkerProvenance(cfg, &a, claimSessionInfo, queryEnv),
 		}
 		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
@@ -507,29 +513,32 @@ const (
 )
 
 // fenceHookClaimSession applies the runtime-identity fence that gates
-// gc hook --claim before it runs the work query. It returns (code, handled):
-// handled is true only for a definitively stale session, whose terminal drain
-// result the caller must return as-is. An un-fenceable context (no session id or
-// no instance token), an eligible session, or a transient session-store fault all
-// return handled=false so the normal claim path runs — the fence never turns an
-// infrastructure hiccup or an in-progress start into a false refusal.
-func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, opts hookCommandOptions, stdout, stderr io.Writer) (int, bool) {
+// gc hook --claim before it runs the work query. It returns (code, handled,
+// info): handled is true only for a definitively stale session, whose terminal
+// drain result the caller must return as-is. An un-fenceable context (no session
+// id or no instance token), an eligible session, or a transient session-store
+// fault all return handled=false so the normal claim path runs — the fence never
+// turns an infrastructure hiccup or an in-progress start into a false refusal.
+// info is the eligible session's loaded bead (nil otherwise), returned so the
+// claim-time provenance stamp reuses the fence's read instead of re-reading.
+func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, opts hookCommandOptions, stdout, stderr io.Writer) (int, bool, *session.Info) {
 	instanceToken := strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN"))
 	if sessionID == "" || instanceToken == "" {
-		return 0, false
+		return 0, false, nil
 	}
-	switch verdict, reason := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken); verdict {
+	verdict, reason, info := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken)
+	switch verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
-		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true
+		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true, nil
 	case hookClaimSessionStoreUnavailable:
 		// Fail open: let the claim path run and surface/escalate its own store
 		// error rather than reporting a false stale session. Name the fault
 		// without the alarming "stale session" wording.
 		fmt.Fprintf(stderr, "gc hook --claim: session fence unavailable for %s: %s; proceeding to claim\n", sessionID, reason) //nolint:errcheck
-		return 0, false
+		return 0, false, nil
 	default:
-		return 0, false
+		return 0, false, info
 	}
 }
 
@@ -541,16 +550,20 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 // hookClaimSessionStoreUnavailable (transient, fails open), so an infrastructure
 // hiccup is not mislabeled as staleness AND a vanished session is not laundered
 // into an infrastructure hiccup that lets a stale runtime reach the claim path.
-func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string) {
+// The loaded session Info is returned (nil when no load succeeded) so the caller
+// can reuse the read for claim-time provenance.
+func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info) {
 	store, err := openCityStoreAt(cityPath)
 	if err != nil {
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err)
+		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err), nil
 	}
 	info, err := cliSessionFrontDoor(store, cfg, cityPath).Get(sessionID)
 	if err != nil {
-		return classifyHookClaimSessionLookupError(err)
+		verdict, reason := classifyHookClaimSessionLookupError(err)
+		return verdict, reason, nil
 	}
-	return hookClaimSessionEligibility(info, instanceToken)
+	verdict, reason := hookClaimSessionEligibility(info, instanceToken)
+	return verdict, reason, &info
 }
 
 // classifyHookClaimSessionLookupError maps a session Store.Get error to a fence

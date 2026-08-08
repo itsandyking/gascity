@@ -293,3 +293,143 @@ func TestDoHookClaimIdentityStampFailureDoesNotFailClaim(t *testing.T) {
 		t.Fatalf("claim result = %+v, want bead hw-err reason claimed", result)
 	}
 }
+
+// workerProvenanceClaimOpts is poolClaimOpts plus a resolved worker
+// provenance triple, the shape cmdHookWithOptions hands the claim path for a
+// live session.
+func workerProvenanceClaimOpts() hookClaimOptions {
+	opts := poolClaimOpts()
+	opts.Worker = workerProvenance{Model: "fable-5", Genus: "anthropic", Effort: "low"}
+	return opts
+}
+
+// TestDoHookClaimStampsWorkerProvenance is the primary cross-genus provenance
+// test (ga-vkcp): a fresh pool claim stamps worker_model / worker_genus /
+// worker_effort onto the work bead in the SAME single patch as the branch and
+// session back-reference, so every dispatch route records executor lineage.
+func TestDoHookClaimStampsWorkerProvenance(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hw-prov","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"bd-hw-prov",
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", workerProvenanceClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{
+		beadmeta.WorkBranchMetadataKey:   "bd-hw-prov",
+		beadmeta.SessionIDMetadataKey:    "mc-sess1",
+		beadmeta.SessionNameMetadataKey:  "gc__role-mc-sess1",
+		beadmeta.WorkerModelMetadataKey:  "fable-5",
+		beadmeta.WorkerGenusMetadataKey:  "anthropic",
+		beadmeta.WorkerEffortMetadataKey: "low",
+	}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v}", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimSkipsWorkerProvenanceWhenCurrent extends the idempotence
+// guard: a bead already carrying the current provenance triple (plus branch
+// and session identity) produces NO write on the per-tick adoption re-run.
+func TestDoHookClaimSkipsWorkerProvenanceWhenCurrent(t *testing.T) {
+	spy := &stampMetaSpy{}
+	current := `{"gc.routed_to":"worker","gc.work_branch":"bd-hw-pidem","gc.session_id":"mc-sess1","gc.session_name":"gc__role-mc-sess1","worker_model":"fable-5","worker_genus":"anthropic","worker_effort":"low"}`
+	ops := poolClaimOps(
+		`[{"id":"hw-pidem","status":"open","metadata":`+current+`}]`,
+		map[string]string{
+			"gc.routed_to": "worker", "gc.work_branch": "bd-hw-pidem",
+			"gc.session_id": "mc-sess1", "gc.session_name": "gc__role-mc-sess1",
+			"worker_model": "fable-5", "worker_genus": "anthropic", "worker_effort": "low",
+		},
+		"bd-hw-pidem",
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", workerProvenanceClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if spy.calls != 0 {
+		t.Fatalf("StampWorkMeta calls = %d, want 0 (provenance already current)", spy.calls)
+	}
+}
+
+// TestDoHookClaimStampsPartialWorkerProvenance: an unresolvable model (the
+// provider CLI picks its own default) must not block the genus/effort stamp,
+// and no fabricated worker_model key may appear.
+func TestDoHookClaimStampsPartialWorkerProvenance(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hw-partialprov","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"",
+		spy,
+	)
+	opts := poolClaimOpts()
+	opts.Worker = workerProvenance{Genus: "anthropic", Effort: "max"}
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{
+		beadmeta.SessionIDMetadataKey:    "mc-sess1",
+		beadmeta.SessionNameMetadataKey:  "gc__role-mc-sess1",
+		beadmeta.WorkerGenusMetadataKey:  "anthropic",
+		beadmeta.WorkerEffortMetadataKey: "max",
+	}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v} (no fabricated worker_model)", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimSkipsWorkerProvenanceForControlBead: control beads stay
+// session-free AND provenance-free — the control dispatcher executing a check
+// is infrastructure, not a worker whose lineage the cross-genus gate reviews.
+func TestDoHookClaimSkipsWorkerProvenanceForControlBead(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hc-provcheck","status":"open","metadata":{"gc.routed_to":"worker","gc.kind":"check"}}]`,
+		map[string]string{"gc.routed_to": "worker", "gc.kind": "check"},
+		"bd-hc-provcheck",
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", workerProvenanceClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{beadmeta.WorkBranchMetadataKey: "bd-hc-provcheck"}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v} (no provenance on a control bead)", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimSkipsWorkerProvenanceWhenNoSessionID: outside a live session
+// (no GC_SESSION_ID) the executor is unknown to gc, so no provenance is
+// stamped even when the template's config would resolve one.
+func TestDoHookClaimSkipsWorkerProvenanceWhenNoSessionID(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hw-provnosess","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"bd-hw-provnosess",
+		spy,
+	)
+	opts := workerProvenanceClaimOpts()
+	opts.Env = []string{"GC_SESSION_NAME=gc__role-mc-sess1"} // GC_SESSION_ID absent
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{beadmeta.WorkBranchMetadataKey: "bd-hw-provnosess"}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v} (no session ⇒ no provenance)", spy.calls, spy.patch, want)
+	}
+}

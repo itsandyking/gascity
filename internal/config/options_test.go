@@ -1307,3 +1307,63 @@ func containsArgPair(args []string, pair []string) bool {
 	}
 	return false
 }
+
+func TestInferOptionDefaultsFromCommand(t *testing.T) {
+	schema := []ProviderOption{
+		{
+			Key: "model",
+			Choices: []OptionChoice{
+				{Value: "", Label: "Default"},
+				{Value: "claude-fable-5", FlagArgs: []string{"--model", "claude-fable-5"}, FlagAliases: [][]string{{"-m", "claude-fable-5"}}},
+				{Value: "opus", FlagArgs: []string{"--model", "claude-opus-4-8"}},
+			},
+		},
+		{
+			Key: "effort",
+			Choices: []OptionChoice{
+				{Value: "low", FlagArgs: []string{"--effort", "low"}},
+				{Value: "max", FlagArgs: []string{"--effort", "max"}},
+			},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		command string
+		want    map[string]string
+	}{
+		{
+			name:    "model and effort flags present",
+			command: `claude --dangerously-skip-permissions --model claude-fable-5 --effort low --settings "/x/settings.json"`,
+			want:    map[string]string{"model": "claude-fable-5", "effort": "low"},
+		},
+		{
+			name:    "effort only",
+			command: "claude --effort max",
+			want:    map[string]string{"effort": "max"},
+		},
+		{
+			name:    "alias form infers the same choice",
+			command: "claude -m claude-fable-5",
+			want:    map[string]string{"model": "claude-fable-5"},
+		},
+		{
+			name:    "no schema flags present",
+			command: "claude --settings /x/settings.json",
+			want:    map[string]string{},
+		},
+		{
+			name:    "empty command",
+			command: "",
+			want:    map[string]string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := InferOptionDefaultsFromCommand(schema, tc.command)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("InferOptionDefaultsFromCommand(%q) = %v, want %v", tc.command, got, tc.want)
+			}
+		})
+	}
+}

@@ -3002,3 +3002,85 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
 	}
 }
+
+// TestCmdHookClaimStampsWorkerProvenanceEndToEnd wires the whole ga-vkcp path:
+// a live pool session (GC_SESSION_ID set) claiming routed work through
+// cmdHookWithOptions resolves its provider's genus/model/effort from the city
+// config and stamps worker_model / worker_genus / worker_effort onto the
+// claimed bead via the bd metadata write — the provenance the cross-genus
+// review policy needs on every dispatch route, not just formula workflows.
+func TestCmdHookClaimStampsWorkerProvenanceEndToEnd(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "test-city"
+
+[providers.fable]
+base = "builtin:claude"
+args_append = ["--model", "claude-fable-5", "--effort", "low"]
+
+[[agent]]
+name = "worker"
+provider = "fable"
+work_query = "printf '[{\"id\":\"ga-prov1\",\"status\":\"open\",\"metadata\":{\"gc.routed_to\":\"worker\"}}]'"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	claimedJSON := `[{"id":"ga-prov1","status":"in_progress","assignee":"gc__worker-mc-p1","metadata":{"gc.routed_to":"worker"}}]`
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+case "$*" in
+  *"--claim"*) printf '%%s' '%s' ;;
+  show*) printf '%%s' '%s' ;;
+  *"--set-metadata"*) printf '[{"id":"ga-prov1"}]' ;;
+  *) printf '[]' ;;
+esac
+`, logPath, claimedJSON, claimedJSON)
+	if err := os.WriteFile(filepath.Join(fakeBin, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_PROVIDER", "") // a leaked live-session provider must not shadow the config
+	t.Setenv("GC_TEMPLATE", "worker")
+	t.Setenv("GC_ALIAS", "worker")
+	t.Setenv("GC_SESSION_NAME", "gc__worker-mc-p1")
+	t.Setenv("GC_SESSION_ID", "mc-p1")
+	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdHookWithOptions(--claim) = %d, want 0; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "work" || result.BeadID != "ga-prov1" {
+		t.Fatalf("result = %+v, want action=work bead ga-prov1", result)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	for _, want := range []string{
+		"--set-metadata worker_model=fable-5",
+		"--set-metadata worker_genus=anthropic",
+		"--set-metadata worker_effort=low",
+	} {
+		if !strings.Contains(string(logData), want) {
+			t.Errorf("claim-time stamp missing %q; bd log:\n%s", want, logData)
+		}
+	}
+}
