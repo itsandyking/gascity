@@ -2679,10 +2679,7 @@ schema = 1
 	if err != nil {
 		t.Fatalf("resolveImportRoot: %v", err)
 	}
-	want, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
-	}
+	want := canonicalTestPath(dir)
 	if got != want {
 		t.Fatalf("resolveImportRoot() = %q, want %q", got, want)
 	}
@@ -2754,10 +2751,7 @@ func TestResolveImportRootPrefersNearestPackUnderCity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveImportRoot: %v", err)
 	}
-	want, err := filepath.EvalSymlinks(packDir)
-	if err != nil {
-		t.Fatalf("EvalSymlinks(%q): %v", packDir, err)
-	}
+	want := canonicalTestPath(packDir)
 	if got != want {
 		t.Fatalf("resolveImportRoot() = %q, want nearest pack %q", got, want)
 	}

@@ -21,9 +21,7 @@ func TestResolveEvaluateStep_DefaultPath(t *testing.T) {
 		t.Errorf("Name = %q, want %q", step.Name, EvaluateStepName)
 	}
 	want := filepath.Join("/home/user/city", DefaultEvaluatePromptPath)
-	if step.PromptPath != want {
-		t.Errorf("PromptPath = %q, want %q", step.PromptPath, want)
-	}
+	testutil.AssertSamePath(t, step.PromptPath, want)
 }
 
 func TestResolveEvaluateStep_CustomPath(t *testing.T) {
@@ -40,9 +38,7 @@ func TestResolveEvaluateStep_CustomPath(t *testing.T) {
 		t.Errorf("Name = %q, want %q", step.Name, EvaluateStepName)
 	}
 	want := filepath.Join("/home/user/city", "custom/my-evaluate.md")
-	if step.PromptPath != want {
-		t.Errorf("PromptPath = %q, want %q", step.PromptPath, want)
-	}
+	testutil.AssertSamePath(t, step.PromptPath, want)
 }
 
 func TestResolveEvaluateStep_PathTraversal(t *testing.T) {

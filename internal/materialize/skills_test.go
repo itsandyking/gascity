@@ -13,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/bootstrap"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func overrideBootstrapPacks(t *testing.T, names ...string) {
@@ -1190,7 +1191,8 @@ func TestCanonicalizePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, _ := filepath.EvalSymlinks(alias)
+	resolvedAlias, _ := filepath.EvalSymlinks(alias)
+	expected := testutil.CanonicalPath(resolvedAlias)
 	if got != expected {
 		t.Errorf("alias dir: got %q, want %q", got, expected)
 	}
@@ -1202,7 +1204,7 @@ func TestCanonicalizePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantPrefix, _ := filepath.EvalSymlinks(alias)
-	wantMissing := filepath.Join(wantPrefix, "not-yet-created", "leaf")
+	wantMissing := filepath.Join(testutil.CanonicalPath(wantPrefix), "not-yet-created", "leaf")
 	if got != wantMissing {
 		t.Errorf("missing tail: got %q, want %q", got, wantMissing)
 	}

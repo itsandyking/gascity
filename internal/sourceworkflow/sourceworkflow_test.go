@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func TestWithLockHonorsContextWhileWaitingForLocalLock(t *testing.T) {
@@ -978,7 +979,7 @@ func TestCanonicalScopeRefResolvesSymlinkedParentWithMissingLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(aliasDir): %v", err)
 	}
-	want := filepath.Join(resolvedAlias, "missing-leaf")
+	want := filepath.Join(testutil.CanonicalPath(resolvedAlias), "missing-leaf")
 	if got != want {
 		t.Errorf("canonicalScopeRef(%q) = %q, want %q (resolved through symlinked parent)", missing, got, want)
 	}
@@ -1023,7 +1024,7 @@ func TestCanonicalCityPathResolvesSymlinkedParentWithMissingLeaf(t *testing.T) {
 	if evalErr != nil {
 		t.Fatalf("EvalSymlinks(aliasDir): %v", evalErr)
 	}
-	want := filepath.Join(resolvedAlias, "missing-leaf")
+	want := filepath.Join(testutil.CanonicalPath(resolvedAlias), "missing-leaf")
 	if got != want {
 		t.Errorf("canonicalCityPath(%q) = %q, want %q (resolved through symlinked parent)", missing, got, want)
 	}

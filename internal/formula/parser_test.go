@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func TestParse_BasicFormula(t *testing.T) {
@@ -3628,10 +3630,11 @@ func TestDescriptionFileBaseDirResolvesSymlinkedParentWithMissingLeaf(t *testing
 	missing := filepath.Join(aliasDir, "not-yet-created.toml")
 	got := descriptionFileBaseDir(missing)
 
-	want, err := filepath.EvalSymlinks(aliasDir)
+	resolvedAlias, err := filepath.EvalSymlinks(aliasDir)
 	if err != nil {
 		t.Fatalf("EvalSymlinks(aliasDir): %v", err)
 	}
+	want := testutil.CanonicalPath(resolvedAlias)
 	if got != want {
 		t.Errorf("descriptionFileBaseDir(%q) = %q, want %q (resolved through symlinked parent)", missing, got, want)
 	}
