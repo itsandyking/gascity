@@ -448,6 +448,11 @@ func TestSlingJSONFromResult(t *testing.T) {
 	if !got.Routed || !got.Queued || got.WorkflowID != "wf-1" || got.ConvoyID != "convoy-1" {
 		t.Fatalf("payload = %+v, want routed queued workflow convoy refs", got)
 	}
+
+	failed := slingJSONFromResult(sling.SlingResult{WakeErrors: []string{"controller wake failed"}})
+	if failed.Success || !slices.Contains(failed.Warnings, "controller wake failed") {
+		t.Fatalf("wake failure payload = %+v, want unsuccessful result with warning", failed)
+	}
 }
 
 func TestDoSlingBeadToFixedAgent(t *testing.T) {
@@ -5302,6 +5307,42 @@ func TestPokeSupervisorReturnsWithoutWaitingForReloadAck(t *testing.T) {
 		t.Fatalf("supervisor accept/read: %v", err)
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for supervisor reload command")
+	}
+}
+
+func TestPokeControllerForSlingReportsFallbackAfterUnacknowledgedCityWake(t *testing.T) {
+	t.Setenv("GC_HOME", shortSocketTempDir(t, "gc-home-"))
+	t.Setenv("XDG_RUNTIME_DIR", shortSocketTempDir(t, "gc-run-"))
+	sockPath := supervisorSocketPath()
+	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(sockPath), err)
+	}
+
+	lis, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("Listen(unix, %q): %v", sockPath, err)
+	}
+	defer lis.Close() //nolint:errcheck
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, acceptErr := lis.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck
+		_, _ = io.ReadAll(conn)
+	}()
+
+	err = pokeControllerForSling(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "supervisor reload was requested") {
+		t.Fatalf("pokeControllerForSling() error = %v, want visible fallback warning", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for supervisor fallback")
 	}
 }
 

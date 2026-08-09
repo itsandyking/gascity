@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -2102,6 +2103,98 @@ func TestControllerPokeTriggersImmediate(t *testing.T) {
 	// Stop controller.
 	tryStopController(dir, &bytes.Buffer{})
 	awaitClose(t, done, "controller to exit")
+}
+
+func TestPokeControllerRejectsUnexpectedAcknowledgement(t *testing.T) {
+	t.Setenv("GC_HOME", shortSocketTempDir(t, "gc-home-"))
+	t.Setenv("XDG_RUNTIME_DIR", shortSocketTempDir(t, "gc-run-"))
+	cityPath := shortSocketTempDir(t, "gc-poke-ack-")
+	if err := os.MkdirAll(filepath.Dir(controllerSocketPath(cityPath)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lis, err := net.Listen("unix", controllerSocketPath(cityPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = lis.Close()
+		_ = os.Remove(controllerSocketPath(cityPath))
+	})
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, acceptErr := lis.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close() //nolint:errcheck // test listener cleanup
+		_, _ = bufio.NewReader(conn).ReadString('\n')
+		_, _ = io.WriteString(conn, "not-ok\n")
+	}()
+
+	if err := pokeController(cityPath); err == nil {
+		t.Fatal("pokeController returned nil for an unexpected controller acknowledgement")
+	}
+	awaitClose(t, served, "unexpected acknowledgement listener")
+}
+
+func TestHandleControllerPokeAcknowledgesOnlyAfterProcessing(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close() //nolint:errcheck // test connection cleanup
+	defer client.Close() //nolint:errcheck // test connection cleanup
+
+	requests := make(chan controllerPokeRequest, 1)
+	responses := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(client).ReadString('\n')
+		responses <- line
+	}()
+	go handleControllerPokeWithTimeouts(server, nil, requests, time.Second, time.Second)
+
+	var req controllerPokeRequest
+	select {
+	case req = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("controller poke was not queued")
+	}
+	select {
+	case got := <-responses:
+		t.Fatalf("poke acknowledgement arrived before processing: %q", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	req.done <- nil
+	select {
+	case got := <-responses:
+		if got != "ok\n" {
+			t.Fatalf("poke response = %q, want ok", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for processed poke acknowledgement")
+	}
+}
+
+func TestHandleControllerPokeReportsUnprocessedRequest(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close() //nolint:errcheck // test connection cleanup
+	defer client.Close() //nolint:errcheck // test connection cleanup
+
+	requests := make(chan controllerPokeRequest, 1)
+	go handleControllerPokeWithTimeouts(server, nil, requests, time.Second, 5*time.Millisecond)
+	select {
+	case <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("controller poke was not queued")
+	}
+
+	line, err := bufio.NewReader(client).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading failed poke response: %v", err)
+	}
+	if !strings.Contains(line, "did not process poke") {
+		t.Fatalf("poke response = %q, want bounded processing failure", line)
+	}
 }
 
 // waitForController polls until the controller socket at dir is responsive,

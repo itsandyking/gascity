@@ -43,6 +43,18 @@ var (
 	errControllerUnresponsive   = errors.New("controller unresponsive")
 )
 
+// controllerPokeRequest is the acknowledged form of a controller wake. The
+// request is delivered to the reconciler loop, which closes the command's
+// ambiguity window only after the requested tick has run (or failed).
+type controllerPokeRequest struct {
+	done chan error
+}
+
+const (
+	controllerPokeEnqueueTimeout = 30 * time.Second
+	controllerPokeProcessTimeout = 60 * time.Second
+)
+
 type controllerCommandError struct {
 	op           string
 	err          error
@@ -149,6 +161,7 @@ func startControllerSocket(
 	convergenceReqCh chan convergenceRequest,
 	pokeCh chan struct{},
 	controlDispatcherCh chan struct{},
+	pokeRequestCh ...chan controllerPokeRequest,
 ) (net.Listener, error) {
 	if !hostingMode.known() {
 		return nil, fmt.Errorf("starting controller socket: invalid hosting mode %q", hostingMode)
@@ -169,7 +182,7 @@ func startControllerSocket(
 			if err != nil {
 				return // listener closed
 			}
-			go handleControllerConn(conn, cityPath, hostingMode, cancelFn, forceShutdown, dirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
+			go handleControllerConn(conn, cityPath, hostingMode, cancelFn, forceShutdown, dirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh, pokeRequestCh...)
 		}
 	}()
 	return lis, nil
@@ -191,6 +204,7 @@ func handleControllerConn(
 	convergenceReqCh chan convergenceRequest,
 	pokeCh chan struct{},
 	controlDispatcherCh chan struct{},
+	pokeRequestCh ...chan controllerPokeRequest,
 ) {
 	defer conn.Close()                                 //nolint:errcheck // best-effort cleanup
 	conn.SetDeadline(time.Now().Add(95 * time.Second)) //nolint:errcheck // symmetric read+write deadline; 5s margin over 30s enqueue + 60s reply
@@ -214,13 +228,7 @@ func handleControllerConn(
 		case line == controllerIdentityCommand:
 			writeJSONLine(conn, controllerIdentityReply{PID: os.Getpid(), HostingMode: hostingMode})
 		case line == "poke":
-			// Non-blocking send: triggers immediate reconciler tick for
-			// event-driven wake after sling assigns work.
-			select {
-			case pokeCh <- struct{}{}:
-			default: // poke already pending
-			}
-			conn.Write([]byte("ok\n")) //nolint:errcheck // best-effort ack
+			handleControllerPoke(conn, pokeCh, firstControllerPokeRequestChannel(pokeRequestCh))
 		case line == "reload":
 			if dirty != nil {
 				dirty.Store(true)
@@ -259,6 +267,58 @@ func handleControllerConn(
 		case line == "trace-status":
 			handleTraceStatusSocketCmd(conn, cityPath)
 		}
+	}
+}
+
+func firstControllerPokeRequestChannel(channels []chan controllerPokeRequest) chan controllerPokeRequest {
+	if len(channels) == 0 {
+		return nil
+	}
+	return channels[0]
+}
+
+// handleControllerPoke sends a wake request to the reconciler and waits for
+// the loop to process it. Legacy callers without a request channel retain the
+// original non-blocking signal behavior; production controller sockets pass a
+// request channel so an acknowledgement cannot outlive the runtime that owns
+// the socket.
+func handleControllerPoke(conn net.Conn, pokeCh chan struct{}, pokeRequestCh chan controllerPokeRequest) {
+	handleControllerPokeWithTimeouts(conn, pokeCh, pokeRequestCh, controllerPokeEnqueueTimeout, controllerPokeProcessTimeout)
+}
+
+func handleControllerPokeWithTimeouts(conn net.Conn, pokeCh chan struct{}, pokeRequestCh chan controllerPokeRequest, enqueueTimeout, processTimeout time.Duration) {
+	if pokeRequestCh == nil {
+		// Non-blocking send: triggers immediate reconciler tick for
+		// event-driven wake after sling assigns work.
+		select {
+		case pokeCh <- struct{}{}:
+		default: // poke already pending
+		}
+		_, _ = conn.Write([]byte("ok\n"))
+		return
+	}
+
+	req := controllerPokeRequest{done: make(chan error, 1)}
+	enqueueTimer := time.NewTimer(enqueueTimeout)
+	defer enqueueTimer.Stop()
+	select {
+	case pokeRequestCh <- req:
+	case <-enqueueTimer.C:
+		_, _ = fmt.Fprintf(conn, "error: controller did not accept poke within %s\n", enqueueTimeout)
+		return
+	}
+
+	processTimer := time.NewTimer(processTimeout)
+	defer processTimer.Stop()
+	select {
+	case err := <-req.done:
+		if err != nil {
+			_, _ = fmt.Fprintf(conn, "error: controller poke failed: %v\n", err)
+			return
+		}
+		_, _ = conn.Write([]byte("ok\n"))
+	case <-processTimer.C:
+		_, _ = fmt.Fprintf(conn, "error: controller did not process poke within %s\n", processTimeout)
 	}
 }
 
@@ -1315,12 +1375,13 @@ func runController(
 	convergenceReqCh := make(chan convergenceRequest, 16)
 	reloadReqCh := make(chan reloadRequest)
 	pokeCh := make(chan struct{}, 1)
+	pokeRequestCh := make(chan controllerPokeRequest, 1)
 	controlDispatcherCh := make(chan struct{}, 1)
 	configDirty := &atomic.Bool{}
 
 	sockPath := controllerSocketPath(cityPath)
 	forceShutdown := &atomic.Bool{}
-	lis, err := startControllerSocket(cityPath, controllerHostingStandalone, cancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
+	lis, err := startControllerSocket(cityPath, controllerHostingStandalone, cancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh, pokeRequestCh)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1371,6 +1432,7 @@ func runController(
 		ReloadReqCh:             reloadReqCh,
 		ConvergenceReqCh:        convergenceReqCh,
 		PokeCh:                  pokeCh,
+		PokeRequestCh:           pokeRequestCh,
 		ControlDispatcherCh:     controlDispatcherCh,
 		Stdout:                  stdout,
 		Stderr:                  stderr,

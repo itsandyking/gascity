@@ -87,6 +87,14 @@ type Notifier interface {
 	PokeControlDispatch(cityPath string)
 }
 
+// controllerWakeErrorNotifier is an optional extension implemented by
+// callers that can report controller wake failures. The base Notifier stays
+// best-effort for in-process callers; CLI callers use this extension to keep a
+// failed IPC wake visible in the SlingResult.
+type controllerWakeErrorNotifier interface {
+	PokeControllerWithError(cityPath string) error
+}
+
 // BeadRouter routes a bead to an agent using typed structured data.
 // Replaces the shell-string SlingRunner for callers using the intent API.
 type BeadRouter interface {
@@ -197,6 +205,7 @@ type SlingResult struct {
 	PoolEmpty      bool     // pool max=0
 	AutoBurned     []string // IDs of auto-burned stale molecules
 	MetadataErrors []string // non-fatal metadata write failures
+	WakeErrors     []string // controller wake failures after routing
 	BeadWarnings   []string // pre-flight bead state warnings
 	Deprecations   []string // deprecated formula constructs (graph.v2 issue alias)
 

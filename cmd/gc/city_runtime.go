@@ -116,6 +116,7 @@ type CityRuntime struct {
 	convergenceReqCh    chan convergenceRequest      // receives CLI commands from controller.sock
 	reloadReqCh         chan reloadRequest           // receives structured reload requests from controller.sock
 	pokeCh              chan struct{}                // non-blocking signal to trigger immediate reconciler tick
+	pokeRequestCh       chan controllerPokeRequest   // acknowledged wake requests from controller.sock
 	controlDispatcherCh chan struct{}                // non-blocking signal for control-dispatcher-only reconcile
 	nudgeWakeCh         chan struct{}                // signal to dispatch queued nudges; fed by wake socket listener
 	reloadMu            sync.Mutex                   // guards activeReload
@@ -178,12 +179,13 @@ type CityRuntimeParams struct {
 	PoolDeathHandlers map[string]poolDeathInfo
 	ForceStopShutdown *atomic.Bool
 
-	ConvergenceReqCh    chan convergenceRequest // may be nil
-	ReloadReqCh         chan reloadRequest      // may be nil; receives structured reload commands
-	PokeCh              chan struct{}           // may be nil; triggers immediate tick
-	ControlDispatcherCh chan struct{}           // may be nil; triggers control-dispatcher-only reconcile
-	OnStarted           func()                  // called after initial reconciliation succeeds
-	OnStatus            func(string)            // called when init status changes
+	ConvergenceReqCh    chan convergenceRequest    // may be nil
+	ReloadReqCh         chan reloadRequest         // may be nil; receives structured reload commands
+	PokeCh              chan struct{}              // may be nil; triggers immediate tick
+	PokeRequestCh       chan controllerPokeRequest // may be nil; acknowledged controller wakes
+	ControlDispatcherCh chan struct{}              // may be nil; triggers control-dispatcher-only reconcile
+	OnStarted           func()                     // called after initial reconciliation succeeds
+	OnStatus            func(string)               // called when init status changes
 	ManagedDoltHealth   func(string) error
 	ManagedDoltOwned    func(string) (bool, error)
 	ManagedDoltPort     func(string) string
@@ -324,6 +326,12 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 				return p.PokeCh
 			}
 			return make(chan struct{}, 1)
+		}(),
+		pokeRequestCh: func() chan controllerPokeRequest {
+			if p.PokeRequestCh != nil {
+				return p.PokeRequestCh
+			}
+			return make(chan controllerPokeRequest, 1)
 		}(),
 		controlDispatcherCh: func() chan struct{} {
 			if p.ControlDispatcherCh != nil {
@@ -654,9 +662,9 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	}
 	// Track pool instance liveness for death detection.
 	var prevPoolRunning map[string]bool
-	runTick := func(trigger string) {
+	runTick := func(trigger string) (panicked bool) {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		// Record the tick reason for any bd subprocess spawned during
 		// this tick — TraceBDCall reads it to attribute calls to
@@ -664,7 +672,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		// previous value on exit so nested ticks don't lose context.
 		prev := beads.SetReconcilerTickTrigger(trigger)
 		defer beads.RestoreReconcilerTickTrigger(prev)
-		cr.safeTick(func() {
+		return cr.safeTick(func() {
 			cr.tick(ctx, dirty, &lastProviderName, cityRoot, &prevPoolRunning, trigger)
 		}, trigger)
 	}
@@ -744,6 +752,16 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			pokeDB.arm(debounce)
 		case <-pokeDB.fired():
 			runTick("poke")
+		case req := <-cr.pokeRequestCh:
+			var err error
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			} else if runTick("poke") {
+				err = errors.New("reconciler tick panicked")
+			}
+			if req.done != nil {
+				req.done <- err
+			}
 		case <-cr.nudgeWakeCh:
 			cr.safeTick(func() {
 				cr.nudgeDispatchTick(ctx)

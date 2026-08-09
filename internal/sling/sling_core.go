@@ -37,6 +37,19 @@ func depsTracef(deps SlingDeps, format string, args ...any) {
 	SlingTracef(format, args...)
 }
 
+func notifyController(deps SlingDeps, result *SlingResult) {
+	if deps.Notify == nil {
+		return
+	}
+	if notifier, ok := deps.Notify.(controllerWakeErrorNotifier); ok {
+		if err := notifier.PokeControllerWithError(deps.CityPath); err != nil {
+			result.WakeErrors = append(result.WakeErrors, fmt.Sprintf("controller wake failed: %v", err))
+		}
+		return
+	}
+	deps.Notify.PokeController(deps.CityPath)
+}
+
 // validateDeps checks that required SlingDeps fields are non-nil.
 func validateDeps(deps SlingDeps) error {
 	if deps.Cfg == nil {
@@ -695,8 +708,8 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 	result.Method = method
 
 	// Poke controller.
-	if !opts.SkipPoke && deps.Notify != nil {
-		deps.Notify.PokeController(deps.CityPath)
+	if !opts.SkipPoke {
+		notifyController(deps, &result)
 	}
 
 	// Signal nudge.
@@ -754,9 +767,7 @@ func doStartGraphWorkflow(rootID, sourceBeadID string, a config.Agent, method st
 		}
 	}
 	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
-	if deps.Notify != nil {
-		deps.Notify.PokeController(deps.CityPath)
-	}
+	notifyController(deps, &result)
 	if deps.Notify != nil {
 		deps.Notify.PokeControlDispatch(deps.CityPath)
 	}
@@ -1674,6 +1685,9 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 	batchResult.Failed = failed
 	batchResult.Skipped = idempotent + len(skipped)
 	batchResult.IdempotentCt = idempotent
+	if !opts.SkipPoke && routed > 0 {
+		notifyController(deps, &batchResult)
+	}
 
 	if opts.Nudge && routed > 0 {
 		batchResult.NudgeAgent = &a

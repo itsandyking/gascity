@@ -169,7 +169,7 @@ Examples:
 type slingOpts = sling.SlingOpts
 
 var (
-	slingPokeController        = pokeController
+	slingPokeController        = pokeControllerForSling
 	slingPokeControlDispatcher = pokeControlDispatch
 	slingOpenCityStore         = openCityStoreAt
 )
@@ -743,6 +743,10 @@ func (cliNotifier) PokeController(cityPath string) {
 	_ = slingPokeController(cityPath)
 }
 
+func (cliNotifier) PokeControllerWithError(cityPath string) error {
+	return slingPokeController(cityPath)
+}
+
 func (cliNotifier) PokeControlDispatch(cityPath string) {
 	_ = slingPokeControlDispatcher(cityPath)
 }
@@ -800,6 +804,9 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 		fmt.Fprintf(stderr, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
 	}
 	for _, e := range result.MetadataErrors {
+		fmt.Fprintf(stderr, "gc sling: %s\n", e) //nolint:errcheck
+	}
+	for _, e := range result.WakeErrors {
 		fmt.Fprintf(stderr, "gc sling: %s\n", e) //nolint:errcheck
 	}
 }
@@ -1134,7 +1141,7 @@ func writeSlingJSONResult(result sling.SlingResult, dashboardURL string, stdout,
 func slingJSONFromResult(result sling.SlingResult) slingJSONResult {
 	payload := slingJSONResult{
 		SchemaVersion: "1",
-		Success:       true,
+		Success:       len(result.WakeErrors) == 0,
 		Target:        result.Target,
 		Method:        result.Method,
 		BeadID:        result.BeadID,
@@ -1174,6 +1181,7 @@ func slingJSONWarnings(result sling.SlingResult) []string {
 	warnings = append(warnings, result.BeadWarnings...)
 	warnings = append(warnings, result.Deprecations...)
 	warnings = append(warnings, result.MetadataErrors...)
+	warnings = append(warnings, result.WakeErrors...)
 	return warnings
 }
 
@@ -1569,12 +1577,39 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 // socket doesn't exist (supervisor model), falls back to sending
 // "reload" to the supervisor socket.
 func pokeController(cityPath string) error {
-	_, err := sendControllerCommand(cityPath, "poke")
+	err := sendControllerPoke(cityPath)
 	if err == nil {
 		return nil
 	}
 	// Fall back to supervisor reload.
-	return pokeSupervisor()
+	supervisorErr := pokeSupervisor()
+	if supervisorErr == nil {
+		return nil
+	}
+	return errors.Join(err, fmt.Errorf("supervisor reload fallback: %w", supervisorErr))
+}
+
+func pokeControllerForSling(cityPath string) error {
+	err := sendControllerPoke(cityPath)
+	if err == nil {
+		return nil
+	}
+	supervisorErr := pokeSupervisor()
+	if supervisorErr != nil {
+		return errors.Join(err, fmt.Errorf("supervisor reload fallback: %w", supervisorErr))
+	}
+	return fmt.Errorf("controller wake was not acknowledged: %w; supervisor reload was requested", err)
+}
+
+func sendControllerPoke(cityPath string) error {
+	resp, err := sendControllerCommand(cityPath, "poke")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(resp)) != "ok" {
+		return fmt.Errorf("controller returned unexpected poke acknowledgement %q", strings.TrimSpace(string(resp)))
+	}
+	return nil
 }
 
 // reloadControllerConfig asks the controller to reload config immediately.

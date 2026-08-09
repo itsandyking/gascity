@@ -102,6 +102,14 @@ type testNotifier struct{}
 func (testNotifier) PokeController(_ string)      {}
 func (testNotifier) PokeControlDispatch(_ string) {}
 
+type failingWakeNotifier struct{}
+
+func (failingWakeNotifier) PokeController(_ string) {}
+func (failingWakeNotifier) PokeControllerWithError(_ string) error {
+	return errors.New("controller unavailable")
+}
+func (failingWakeNotifier) PokeControlDispatch(_ string) {}
+
 func testDeps(cfg *config.City, sp runtime.Provider, runner SlingRunner) SlingDeps {
 	if cfg != nil && len(cfg.FormulaLayers.City) == 0 {
 		cfg.FormulaLayers.City = []string{sharedTestFormulaDir}
@@ -1074,6 +1082,21 @@ func TestDoSlingBeadToFixedAgent(t *testing.T) {
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("got %d runner calls, want 1", len(runner.calls))
+	}
+}
+
+func TestDoSlingSurfacesControllerWakeFailure(t *testing.T) {
+	runner := newFakeRunner()
+	deps := testDeps(&config.City{Workspace: config.Workspace{Name: "test-city"}}, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-42")
+	deps.Notify = failingWakeNotifier{}
+
+	result, err := DoSling(testOpts(config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}, "BL-42"), deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	if len(result.WakeErrors) != 1 || result.WakeErrors[0] != "controller wake failed: controller unavailable" {
+		t.Fatalf("WakeErrors = %#v, want controller wake failure", result.WakeErrors)
 	}
 }
 
