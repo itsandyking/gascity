@@ -10,6 +10,12 @@ func ScanBySessionID(string) ([]runtime.LiveRuntime, error) {
 	return []runtime.LiveRuntime{}, nil
 }
 
+// FindEnvironmentBySessionID is unavailable on platforms without process
+// environment scanning support.
+func FindEnvironmentBySessionID(string, string) (string, error) {
+	return "", nil
+}
+
 // IsScanRoot reports false on platforms without process environment scanning
 // support.
 func IsScanRoot(int) bool {

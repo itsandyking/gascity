@@ -19,6 +19,8 @@ type Provider struct {
 
 var (
 	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.NudgeStatusProvider           = (*Provider)(nil)
+	_ runtime.ImmediateNudgeStatusProvider  = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.InteractionProvider           = (*Provider)(nil)
 	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
@@ -98,6 +100,19 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	return p.route(name).Nudge(name, content)
 }
 
+// NudgeWithStatus delegates status-aware delivery to the routed backend and
+// treats a successful legacy Nudge as directly delivered.
+func (p *Provider) NudgeWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	provider := p.route(name)
+	if status, ok := provider.(runtime.NudgeStatusProvider); ok {
+		return status.NudgeWithStatus(name, content)
+	}
+	if err := provider.Nudge(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeDelivered, nil
+}
+
 // WaitForIdle delegates to the routed backend when it supports explicit
 // idle-boundary waiting.
 func (p *Provider) WaitForIdle(ctx context.Context, name string, timeout time.Duration) error {
@@ -114,6 +129,25 @@ func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
 		return np.NudgeNow(name, content)
 	}
 	return p.route(name).Nudge(name, content)
+}
+
+// NudgeNowWithStatus delegates immediate status-aware delivery to the routed
+// backend and treats a successful legacy nudge as directly delivered.
+func (p *Provider) NudgeNowWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	provider := p.route(name)
+	if status, ok := provider.(runtime.ImmediateNudgeStatusProvider); ok {
+		return status.NudgeNowWithStatus(name, content)
+	}
+	if immediate, ok := provider.(runtime.ImmediateNudgeProvider); ok {
+		if err := immediate.NudgeNow(name, content); err != nil {
+			return "", err
+		}
+		return runtime.NudgeOutcomeDelivered, nil
+	}
+	if err := provider.Nudge(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeDelivered, nil
 }
 
 // ResetInterruptedTurn delegates to the routed backend when it supports

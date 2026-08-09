@@ -825,8 +825,12 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	if mode == nudgeDeliveryWaitIdle && !result.Delivered {
+	if mode == nudgeDeliveryWaitIdle && !result.Accepted() {
 		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, stdout, stderr)
+	}
+	outcome := "delivered"
+	if result.Queued {
+		outcome = "queued"
 	}
 	if jsonOutput {
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc session nudge", sessionNudgeJSON{
@@ -836,9 +840,13 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 			SessionID:     target.sessionID,
 			SessionName:   target.sessionName,
 			Delivery:      string(mode),
-			Queued:        false,
-			Outcome:       "delivered",
+			Queued:        result.Queued,
+			Outcome:       outcome,
 		})
+	}
+	if result.Queued {
+		fmt.Fprintf(stdout, "Queued nudge for %s (runtime inbox)\n", target.agentKey()) //nolint:errcheck
+		return 0
 	}
 	fmt.Fprintf(stdout, "Nudged %s\n", target.agentKey()) //nolint:errcheck
 	return 0
@@ -1123,7 +1131,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 				Source:   "mail",
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
-			if nudgeErr == nil && result.Delivered {
+			if nudgeErr == nil && result.Accepted() {
 				telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 				var sessFront *session.Store
 				if store != nil {
@@ -1398,7 +1406,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		}
 		return false, bookkeepErr
 	}
-	if !result.Delivered {
+	if !result.Accepted() {
 		// The runtime declined without an error (e.g. the session stopped
 		// between observation and delivery). Release the claims so the next
 		// pass retries promptly instead of waiting out the in-flight lease.

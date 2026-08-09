@@ -263,16 +263,18 @@ func (h *RuntimeHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 	}
 	switch req.Delivery {
 	case "", NudgeDeliveryDefault:
-		if err := h.provider.Nudge(h.sessionName, runtime.TextContent(req.Text)); err != nil {
+		outcome, err := h.nudgeWithStatus(req.Text)
+		if err != nil {
 			return NudgeResult{}, err
 		}
-		result = NudgeResult{Delivered: true}
+		result = nudgeResultFromOutcome(outcome)
 		return result, nil
 	case NudgeDeliveryImmediate:
-		if err := h.nudgeNow(req.Text); err != nil {
+		outcome, err := h.nudgeNow(req.Text)
+		if err != nil {
 			return NudgeResult{}, err
 		}
-		result = NudgeResult{Delivered: true}
+		result = nudgeResultFromOutcome(outcome)
 		return result, nil
 	case NudgeDeliveryWaitIdle:
 		result, err = h.nudgeWaitIdle(ctx, req)
@@ -384,12 +386,46 @@ func (h *RuntimeHandle) Respond(_ context.Context, req InteractionResponse) erro
 
 const runtimeHandleWaitIdleTimeout = 30 * time.Second
 
-func (h *RuntimeHandle) nudgeNow(message string) error {
-	content := runtime.TextContent(message)
-	if immediate, ok := h.provider.(runtime.ImmediateNudgeProvider); ok {
-		return immediate.NudgeNow(h.sessionName, content)
+func nudgeResultFromOutcome(outcome runtime.NudgeOutcome) NudgeResult {
+	switch outcome {
+	case runtime.NudgeOutcomeDelivered:
+		return NudgeResult{Delivered: true}
+	case runtime.NudgeOutcomeQueued:
+		return NudgeResult{Queued: true}
+	default:
+		return NudgeResult{}
 	}
-	return h.provider.Nudge(h.sessionName, content)
+}
+
+func (h *RuntimeHandle) nudgeWithStatus(message string) (runtime.NudgeOutcome, error) {
+	content := runtime.TextContent(message)
+	if status, ok := h.provider.(runtime.NudgeStatusProvider); ok {
+		return status.NudgeWithStatus(h.sessionName, content)
+	}
+	if err := h.provider.Nudge(h.sessionName, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeDelivered, nil
+}
+
+func (h *RuntimeHandle) nudgeNow(message string) (runtime.NudgeOutcome, error) {
+	content := runtime.TextContent(message)
+	if status, ok := h.provider.(runtime.ImmediateNudgeStatusProvider); ok {
+		return status.NudgeNowWithStatus(h.sessionName, content)
+	}
+	if immediate, ok := h.provider.(runtime.ImmediateNudgeProvider); ok {
+		if err := immediate.NudgeNow(h.sessionName, content); err != nil {
+			return "", err
+		}
+		return runtime.NudgeOutcomeDelivered, nil
+	}
+	if status, ok := h.provider.(runtime.NudgeStatusProvider); ok {
+		return status.NudgeWithStatus(h.sessionName, content)
+	}
+	if err := h.provider.Nudge(h.sessionName, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeDelivered, nil
 }
 
 func (h *RuntimeHandle) nudgeWaitIdle(ctx context.Context, req NudgeRequest) (NudgeResult, error) {
@@ -397,10 +433,11 @@ func (h *RuntimeHandle) nudgeWaitIdle(ctx context.Context, req NudgeRequest) (Nu
 		ctx = context.Background()
 	}
 	if h.transport == "acp" {
-		if err := h.provider.Nudge(h.sessionName, runtime.TextContent(req.Text)); err != nil {
+		outcome, err := h.nudgeWithStatus(req.Text)
+		if err != nil {
 			return NudgeResult{}, err
 		}
-		return NudgeResult{Delivered: true}, nil
+		return nudgeResultFromOutcome(outcome), nil
 	}
 	if h.providerName != "claude" {
 		return NudgeResult{Delivered: false}, nil
@@ -421,10 +458,11 @@ func (h *RuntimeHandle) nudgeWaitIdle(ctx context.Context, req NudgeRequest) (Nu
 		}
 		return NudgeResult{Delivered: false}, nil
 	}
-	if err := h.nudgeNow(formatRuntimeWaitIdleReminder(req.Source, req.Text)); err != nil {
+	outcome, err := h.nudgeNow(formatRuntimeWaitIdleReminder(req.Source, req.Text))
+	if err != nil {
 		return NudgeResult{}, err
 	}
-	return NudgeResult{Delivered: true}, nil
+	return nudgeResultFromOutcome(outcome), nil
 }
 
 func formatRuntimeWaitIdleReminder(source, message string) string {

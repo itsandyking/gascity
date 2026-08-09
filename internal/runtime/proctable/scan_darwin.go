@@ -59,6 +59,36 @@ func ScanBySessionID(id string) ([]runtime.LiveRuntime, error) {
 	return out, nil
 }
 
+// FindEnvironmentBySessionID returns the first non-empty environment value
+// named key observed in a live process belonging to id.
+func FindEnvironmentBySessionID(id, key string) (string, error) {
+	if id == "" || key == "" {
+		return "", nil
+	}
+	if err := liveScanGuard(); err != nil {
+		return "", err
+	}
+	records, err := psRecords()
+	if err != nil {
+		return "", err
+	}
+	pids := make([]int, 0, len(records))
+	for pid := range records {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	for _, pid := range pids {
+		record := records[pid]
+		if record.env["GC_SESSION_ID"] != id {
+			continue
+		}
+		if value := record.env[key]; value != "" {
+			return value, nil
+		}
+	}
+	return "", nil
+}
+
 // IsScanRoot reports whether pid is outside its GC_SESSION_ID parent's
 // envelope and should be treated as an agent root.
 func IsScanRoot(pid int) bool {

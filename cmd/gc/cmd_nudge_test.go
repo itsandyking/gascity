@@ -506,6 +506,50 @@ func TestDeliverSessionNudgeWithProviderWaitIdleQueuesForCodex(t *testing.T) {
 	}
 }
 
+type queuedStatusProvider struct {
+	*runtime.Fake
+}
+
+func (p *queuedStatusProvider) NudgeWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	if err := p.Nudge(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeQueued, nil
+}
+
+func (p *queuedStatusProvider) NudgeNowWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	if err := p.NudgeNow(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeQueued, nil
+}
+
+func TestDeliverSessionNudgeReportsRuntimeInboxQueue(t *testing.T) {
+	fake := &queuedStatusProvider{Fake: runtime.NewFake()}
+	if err := fake.Start(context.Background(), "sess-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	target := nudgeTarget{
+		cityPath:    t.TempDir(),
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionName: "sess-worker",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := deliverSessionNudgeWithWorker(target, nil, fake, "check deploy status", nudgeDeliveryImmediate, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var got sessionNudgeJSON
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("JSON output %q: %v", stdout.String(), err)
+	}
+	if !got.OK || !got.Queued || got.Outcome != "queued" {
+		t.Fatalf("nudge result = %#v, want queued outcome", got)
+	}
+}
+
 func TestDeliverSessionNudgeWithWorkerImmediateResumesSuspendedSession(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()

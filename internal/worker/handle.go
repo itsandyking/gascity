@@ -178,9 +178,16 @@ type NudgeRequest struct {
 	Wake     NudgeWakePolicy `json:"wake,omitempty"`
 }
 
-// NudgeResult reports whether the requested live delivery actually happened.
+// NudgeResult reports whether the requested live delivery happened or was
+// accepted by a provider-owned inbox.
 type NudgeResult struct {
 	Delivered bool `json:"delivered"`
+	Queued    bool `json:"queued"`
+}
+
+// Accepted reports whether the runtime accepted the nudge for delivery.
+func (r NudgeResult) Accepted() bool {
+	return r.Delivered || r.Queued
 }
 
 // NudgeWakePolicy controls whether a nudge may wake a stopped session.

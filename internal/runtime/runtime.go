@@ -302,10 +302,42 @@ type TransportCapabilityProvider interface {
 	SupportsTransport(transport string) bool
 }
 
+// NudgeOutcome describes what a provider knows about a nudge after its write
+// operation completes.
+type NudgeOutcome string
+
+const (
+	// NudgeOutcomeDelivered means the provider completed its live delivery
+	// operation. The receiving process may still be between tool calls.
+	NudgeOutcomeDelivered NudgeOutcome = "delivered"
+	// NudgeOutcomeQueued means the provider accepted the message into a
+	// provider-owned inbox, but has not observed the receiver reading it.
+	NudgeOutcomeQueued NudgeOutcome = "queued"
+)
+
+// Accepted reports whether a provider accepted a nudge for delivery.
+func (o NudgeOutcome) Accepted() bool {
+	return o == NudgeOutcomeDelivered || o == NudgeOutcomeQueued
+}
+
 // ImmediateNudgeProvider is an optional extension for runtimes that can inject
 // input immediately without performing their own wait-idle heuristic first.
 type ImmediateNudgeProvider interface {
 	NudgeNow(name string, content []ContentBlock) error
+}
+
+// NudgeStatusProvider is an optional extension for runtimes that can report
+// whether a nudge was delivered directly or accepted by a provider-owned
+// inbox. Providers that do not implement it are treated as delivered when
+// their legacy Nudge method returns nil.
+type NudgeStatusProvider interface {
+	NudgeWithStatus(name string, content []ContentBlock) (NudgeOutcome, error)
+}
+
+// ImmediateNudgeStatusProvider is the status-reporting counterpart to
+// [ImmediateNudgeProvider].
+type ImmediateNudgeStatusProvider interface {
+	NudgeNowWithStatus(name string, content []ContentBlock) (NudgeOutcome, error)
 }
 
 // InterruptedTurnResetProvider is an optional extension for runtimes that can

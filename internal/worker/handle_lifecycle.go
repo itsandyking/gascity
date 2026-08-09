@@ -321,46 +321,48 @@ func (h *SessionHandle) Nudge(ctx context.Context, req NudgeRequest) (result Nud
 	switch req.Delivery {
 	case "", NudgeDeliveryDefault:
 		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.SendLiveOnly(ctx, id, req.Text)
+			outcome, err := h.manager.SendLiveOnlyWithOutcome(ctx, id, req.Text)
 			if err != nil {
 				return NudgeResult{}, err
 			}
-			result = NudgeResult{Delivered: delivered}
+			result = nudgeResultFromOutcome(outcome)
 			return result, nil
 		}
-		if err := h.manager.Send(ctx, id, req.Text, resumeCommand, h.runtimeHints()); err != nil {
-			return NudgeResult{}, err
-		}
-		result = NudgeResult{Delivered: true}
-		return result, nil
-	case NudgeDeliveryImmediate:
-		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.SendImmediateLiveOnly(ctx, id, req.Text)
-			if err != nil {
-				return NudgeResult{}, err
-			}
-			result = NudgeResult{Delivered: delivered}
-			return result, nil
-		}
-		if err := h.manager.SendImmediate(ctx, id, req.Text, resumeCommand, h.runtimeHints()); err != nil {
-			return NudgeResult{}, err
-		}
-		result = NudgeResult{Delivered: true}
-		return result, nil
-	case NudgeDeliveryWaitIdle:
-		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
-			delivered, err := h.manager.TryWaitIdleNudgeLiveOnly(ctx, id, req.Source, req.Text)
-			if err != nil {
-				return NudgeResult{}, err
-			}
-			result = NudgeResult{Delivered: delivered}
-			return result, nil
-		}
-		delivered, err := h.manager.TryWaitIdleNudge(ctx, id, req.Source, req.Text, resumeCommand, h.runtimeHints())
+		outcome, err := h.manager.SendWithOutcome(ctx, id, req.Text, resumeCommand, h.runtimeHints())
 		if err != nil {
 			return NudgeResult{}, err
 		}
-		result = NudgeResult{Delivered: delivered}
+		result = nudgeResultFromOutcome(outcome)
+		return result, nil
+	case NudgeDeliveryImmediate:
+		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
+			outcome, err := h.manager.SendImmediateLiveOnlyWithOutcome(ctx, id, req.Text)
+			if err != nil {
+				return NudgeResult{}, err
+			}
+			result = nudgeResultFromOutcome(outcome)
+			return result, nil
+		}
+		outcome, err := h.manager.SendImmediateWithOutcome(ctx, id, req.Text, resumeCommand, h.runtimeHints())
+		if err != nil {
+			return NudgeResult{}, err
+		}
+		result = nudgeResultFromOutcome(outcome)
+		return result, nil
+	case NudgeDeliveryWaitIdle:
+		if normalizeNudgeWakePolicy(req.Wake) == NudgeWakeLiveOnly {
+			outcome, err := h.manager.TryWaitIdleNudgeLiveOnlyWithOutcome(ctx, id, req.Source, req.Text)
+			if err != nil {
+				return NudgeResult{}, err
+			}
+			result = nudgeResultFromOutcome(outcome)
+			return result, nil
+		}
+		outcome, err := h.manager.TryWaitIdleNudgeWithOutcome(ctx, id, req.Source, req.Text, resumeCommand, h.runtimeHints())
+		if err != nil {
+			return NudgeResult{}, err
+		}
+		result = nudgeResultFromOutcome(outcome)
 		return result, nil
 	default:
 		err = fmt.Errorf("unknown nudge delivery %q", req.Delivery)

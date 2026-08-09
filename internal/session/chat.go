@@ -619,25 +619,47 @@ func formatWaitIdleReminder(source, message string) string {
 
 func (m *Manager) nudgeSession(ctx context.Context, sessName, message string, immediate bool) error {
 	content := runtime.TextContent(message)
-	err := m.nudgeContent(sessName, content, immediate)
+	_, err := m.nudgeSessionWithOutcome(ctx, sessName, content, immediate)
+	return err
+}
+
+func (m *Manager) nudgeSessionWithOutcome(ctx context.Context, sessName string, content []runtime.ContentBlock, immediate bool) (runtime.NudgeOutcome, error) {
+	outcome, err := m.nudgeContentWithOutcome(sessName, content, immediate)
 	recordCtx := ctx
 	if recordCtx == nil || recordCtx.Err() != nil {
 		recordCtx = context.Background()
 	}
 	telemetry.RecordNudge(recordCtx, sessName, err)
 	if err != nil {
-		return fmt.Errorf("sending message to session: %w", err)
+		return "", fmt.Errorf("sending message to session: %w", err)
 	}
-	return nil
+	return outcome, nil
 }
 
 func (m *Manager) nudgeContent(sessName string, content []runtime.ContentBlock, immediate bool) error {
+	_, err := m.nudgeContentWithOutcome(sessName, content, immediate)
+	return err
+}
+
+func (m *Manager) nudgeContentWithOutcome(sessName string, content []runtime.ContentBlock, immediate bool) (runtime.NudgeOutcome, error) {
 	if immediate {
+		if np, ok := m.sp.(runtime.ImmediateNudgeStatusProvider); ok {
+			return np.NudgeNowWithStatus(sessName, content)
+		}
 		if np, ok := m.sp.(runtime.ImmediateNudgeProvider); ok {
-			return np.NudgeNow(sessName, content)
+			if err := np.NudgeNow(sessName, content); err != nil {
+				return "", err
+			}
+			return runtime.NudgeOutcomeDelivered, nil
 		}
 	}
-	return m.sp.Nudge(sessName, content)
+	if np, ok := m.sp.(runtime.NudgeStatusProvider); ok {
+		return np.NudgeWithStatus(sessName, content)
+	}
+	if err := m.sp.Nudge(sessName, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeDelivered, nil
 }
 
 func normalizeWaitIdleNudgeSource(source string) string {
@@ -649,58 +671,72 @@ func normalizeWaitIdleNudgeSource(source string) string {
 }
 
 func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, id string, b beads.Bead, source, sessName, message, resumeCommand string, hints runtime.Config) (bool, error) {
+	outcome, err := m.tryWaitIdleNudgeLockedWithOutcome(ctx, id, b, source, sessName, message, resumeCommand, hints)
+	return outcome.Accepted(), err
+}
+
+func (m *Manager) tryWaitIdleNudgeLockedWithOutcome(ctx context.Context, id string, b beads.Bead, source, sessName, message, resumeCommand string, hints runtime.Config) (runtime.NudgeOutcome, error) {
 	if transportFromMetadata(b) == "acp" {
 		if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
-			return false, err
+			return "", err
 		}
-		if err := m.nudgeSession(ctx, sessName, message, false); err != nil {
-			return false, err
+		outcome, err := m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(message), false)
+		if err != nil {
+			return "", err
 		}
-		return true, nil
+		return outcome, nil
 	}
 	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
-		return false, err
+		return "", err
 	}
 	if providerKind(b) != "claude" {
-		return false, nil
+		return "", nil
 	}
 	waiter, ok := m.sp.(runtime.IdleWaitProvider)
 	if !ok {
-		return false, nil
+		return "", nil
 	}
 	if err := waiter.WaitForIdle(ctx, sessName, waitIdleNudgeTimeout); err != nil {
-		return false, nil
+		return "", nil
 	}
-	if err := m.nudgeSession(ctx, sessName, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
-		return false, nil
+	outcome, err := m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message)), true)
+	if err != nil {
+		return "", nil
 	}
-	return true, nil
+	return outcome, nil
 }
 
 func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Bead, source, sessName, message string) (bool, error) {
+	outcome, err := m.tryWaitIdleNudgeLiveOnlyLockedWithOutcome(ctx, b, source, sessName, message)
+	return outcome.Accepted(), err
+}
+
+func (m *Manager) tryWaitIdleNudgeLiveOnlyLockedWithOutcome(ctx context.Context, b beads.Bead, source, sessName, message string) (runtime.NudgeOutcome, error) {
 	if !m.sp.IsRunning(sessName) {
-		return false, nil
+		return "", nil
 	}
 	if transportFromMetadata(b) == "acp" {
-		if err := m.nudgeSession(ctx, sessName, message, false); err != nil {
-			return false, err
+		outcome, err := m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(message), false)
+		if err != nil {
+			return "", err
 		}
-		return true, nil
+		return outcome, nil
 	}
 	if providerKind(b) != "claude" {
-		return false, nil
+		return "", nil
 	}
 	waiter, ok := m.sp.(runtime.IdleWaitProvider)
 	if !ok {
-		return false, nil
+		return "", nil
 	}
 	if err := waiter.WaitForIdle(ctx, sessName, waitIdleNudgeTimeout); err != nil {
-		return false, nil
+		return "", nil
 	}
-	if err := m.nudgeSession(ctx, sessName, formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message), true); err != nil {
-		return false, nil
+	outcome, err := m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(formatWaitIdleReminder(normalizeWaitIdleNudgeSource(source), message)), true)
+	if err != nil {
+		return "", nil
 	}
-	return true, nil
+	return outcome, nil
 }
 
 func (m *Manager) pendingInteractionLocked(sessName string) error {
@@ -736,53 +772,72 @@ func (m *Manager) markStartupDialogsVerifiedLocked(id string, b *beads.Bead) {
 }
 
 func (m *Manager) sendLocked(ctx context.Context, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool) error {
+	_, err := m.sendLockedWithOutcome(ctx, id, b, sessName, message, resumeCommand, hints, immediate)
+	return err
+}
+
+func (m *Manager) sendLockedWithOutcome(ctx context.Context, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config, immediate bool) (runtime.NudgeOutcome, error) {
 	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
-		return err
+		return "", err
 	}
 	verifyDeferredDialogs := needsDeferredStartupDialogVerification(b)
 	if verifyDeferredDialogs {
 		m.dismissKnownDialogsLocked(ctx, sessName, codexDeferredDialogDelay)
 	}
 	if err := m.pendingInteractionLocked(sessName); err != nil {
-		return err
+		return "", err
 	}
-	if err := m.nudgeSession(ctx, sessName, message, immediate); err != nil {
-		return err
+	outcome, err := m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(message), immediate)
+	if err != nil {
+		return "", err
 	}
 	if verifyDeferredDialogs && m.dismissKnownDialogsLocked(ctx, sessName, codexDeferredDialogDelay) {
 		m.markStartupDialogsVerifiedLocked(id, &b)
 	}
-	return nil
+	return outcome, nil
 }
 
 func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, immediate bool) error {
-	return withSessionMutationLock(id, func() error {
+	_, err := m.sendWithOutcome(ctx, id, message, resumeCommand, hints, immediate)
+	return err
+}
+
+func (m *Manager) sendWithOutcome(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, immediate bool) (runtime.NudgeOutcome, error) {
+	var outcome runtime.NudgeOutcome
+	err := withSessionMutationLock(id, func() error {
 		b, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
-		return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, immediate)
+		outcome, err = m.sendLockedWithOutcome(ctx, id, b, sessName, message, resumeCommand, hints, immediate)
+		return err
 	})
+	return outcome, err
 }
 
 func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool) (bool, error) {
-	var delivered bool
+	outcome, err := m.sendLiveOnlyWithOutcome(ctx, id, message, immediate)
+	return outcome.Accepted(), err
+}
+
+func (m *Manager) sendLiveOnlyWithOutcome(ctx context.Context, id, message string, immediate bool) (runtime.NudgeOutcome, error) {
+	var outcome runtime.NudgeOutcome
 	err := withSessionMutationLock(id, func() error {
 		_, sessName, err := m.sessionBead(id)
 		if err != nil {
 			return err
 		}
 		if !m.sp.IsRunning(sessName) {
-			delivered = false
 			return nil
 		}
-		if err := m.nudgeSession(ctx, sessName, message, immediate); err != nil {
-			return err
+		var nudgeErr error
+		outcome, nudgeErr = m.nudgeSessionWithOutcome(ctx, sessName, runtime.TextContent(message), immediate)
+		if nudgeErr != nil {
+			return nudgeErr
 		}
-		delivered = true
 		return nil
 	})
-	return delivered, err
+	return outcome, err
 }
 
 // Start ensures the session runtime is live without sending a message.
@@ -818,6 +873,12 @@ func (m *Manager) Send(ctx context.Context, id, message, resumeCommand string, h
 	return m.send(ctx, id, message, resumeCommand, hints, false)
 }
 
+// SendWithOutcome is Send with provider delivery status preserved for worker
+// callers that need to distinguish direct delivery from inbox acceptance.
+func (m *Manager) SendWithOutcome(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) (runtime.NudgeOutcome, error) {
+	return m.sendWithOutcome(ctx, id, message, resumeCommand, hints, false)
+}
+
 // SendImmediate resumes a suspended session if needed, then injects the new
 // user message without waiting for an idle boundary when the runtime supports
 // immediate nudges. Falls back to Send semantics on runtimes without the
@@ -826,16 +887,34 @@ func (m *Manager) SendImmediate(ctx context.Context, id, message, resumeCommand 
 	return m.send(ctx, id, message, resumeCommand, hints, true)
 }
 
+// SendImmediateWithOutcome is SendImmediate with provider delivery status
+// preserved for worker callers.
+func (m *Manager) SendImmediateWithOutcome(ctx context.Context, id, message, resumeCommand string, hints runtime.Config) (runtime.NudgeOutcome, error) {
+	return m.sendWithOutcome(ctx, id, message, resumeCommand, hints, true)
+}
+
 // SendLiveOnly nudges the runtime only when the current session is already
 // running. It never resumes or restarts the session.
 func (m *Manager) SendLiveOnly(ctx context.Context, id, message string) (bool, error) {
 	return m.sendLiveOnly(ctx, id, message, false)
 }
 
+// SendLiveOnlyWithOutcome is SendLiveOnly with provider delivery status
+// preserved for worker callers.
+func (m *Manager) SendLiveOnlyWithOutcome(ctx context.Context, id, message string) (runtime.NudgeOutcome, error) {
+	return m.sendLiveOnlyWithOutcome(ctx, id, message, false)
+}
+
 // SendImmediateLiveOnly is like SendLiveOnly but uses the immediate nudge path
 // when the runtime supports it. It never resumes or restarts the session.
 func (m *Manager) SendImmediateLiveOnly(ctx context.Context, id, message string) (bool, error) {
 	return m.sendLiveOnly(ctx, id, message, true)
+}
+
+// SendImmediateLiveOnlyWithOutcome is SendImmediateLiveOnly with provider
+// delivery status preserved for worker callers.
+func (m *Manager) SendImmediateLiveOnlyWithOutcome(ctx context.Context, id, message string) (runtime.NudgeOutcome, error) {
+	return m.sendLiveOnlyWithOutcome(ctx, id, message, true)
 }
 
 // TryWaitIdleNudge delivers a best-effort session nudge at a provider-defined
@@ -856,6 +935,21 @@ func (m *Manager) TryWaitIdleNudge(ctx context.Context, id, source, message, res
 	return delivered, err
 }
 
+// TryWaitIdleNudgeWithOutcome is TryWaitIdleNudge with provider delivery
+// status preserved for worker callers.
+func (m *Manager) TryWaitIdleNudgeWithOutcome(ctx context.Context, id, source, message, resumeCommand string, hints runtime.Config) (runtime.NudgeOutcome, error) {
+	var outcome runtime.NudgeOutcome
+	err := withSessionMutationLock(id, func() error {
+		b, sessName, err := m.sessionBead(id)
+		if err != nil {
+			return err
+		}
+		outcome, err = m.tryWaitIdleNudgeLockedWithOutcome(ctx, id, b, source, sessName, message, resumeCommand, hints)
+		return err
+	})
+	return outcome, err
+}
+
 // TryWaitIdleNudgeLiveOnly delivers a best-effort nudge at a safe boundary
 // only when the runtime is already live. It never resumes or restarts the
 // session.
@@ -870,6 +964,21 @@ func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, mess
 		return err
 	})
 	return delivered, err
+}
+
+// TryWaitIdleNudgeLiveOnlyWithOutcome is TryWaitIdleNudgeLiveOnly with
+// provider delivery status preserved for worker callers.
+func (m *Manager) TryWaitIdleNudgeLiveOnlyWithOutcome(ctx context.Context, id, source, message string) (runtime.NudgeOutcome, error) {
+	var outcome runtime.NudgeOutcome
+	err := withSessionMutationLock(id, func() error {
+		b, sessName, err := m.sessionBead(id)
+		if err != nil {
+			return err
+		}
+		outcome, err = m.tryWaitIdleNudgeLiveOnlyLockedWithOutcome(ctx, b, source, sessName, message)
+		return err
+	})
+	return outcome, err
 }
 
 // StopTurn issues a provider-appropriate interrupt for the currently running

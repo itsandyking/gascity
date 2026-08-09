@@ -1533,6 +1533,93 @@ func TestRuntimeHandleNudgeImmediateUsesImmediateProvider(t *testing.T) {
 	}
 }
 
+type queuedNudgeRuntimeProvider struct {
+	*runtime.Fake
+}
+
+func (p *queuedNudgeRuntimeProvider) NudgeWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	if err := p.Nudge(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeQueued, nil
+}
+
+func (p *queuedNudgeRuntimeProvider) NudgeNowWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	if err := p.NudgeNow(name, content); err != nil {
+		return "", err
+	}
+	return runtime.NudgeOutcomeQueued, nil
+}
+
+func TestRuntimeHandleNudgeReportsProviderInboxQueue(t *testing.T) {
+	sp := &queuedNudgeRuntimeProvider{Fake: runtime.NewFake()}
+	if err := sp.Start(context.Background(), "legacy-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	handle, err := NewRuntimeHandle(RuntimeHandleConfig{
+		Provider:     sp,
+		SessionName:  "legacy-worker",
+		ProviderName: "claude",
+	})
+	if err != nil {
+		t.Fatalf("NewRuntimeHandle: %v", err)
+	}
+
+	for _, delivery := range []NudgeDelivery{NudgeDeliveryDefault, NudgeDeliveryImmediate} {
+		result, err := handle.Nudge(context.Background(), NudgeRequest{
+			Text:     "check deploy status",
+			Delivery: delivery,
+		})
+		if err != nil {
+			t.Fatalf("Nudge(%s): %v", delivery, err)
+		}
+		if result.Delivered {
+			t.Fatalf("Nudge(%s) Delivered = true, want false for inbox queue", delivery)
+		}
+		if !result.Queued || !result.Accepted() {
+			t.Fatalf("Nudge(%s) result = %#v, want queued and accepted", delivery, result)
+		}
+	}
+}
+
+func TestSessionHandleNudgePreservesProviderInboxQueue(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &queuedNudgeRuntimeProvider{Fake: runtime.NewFake()}
+	manager := sessionpkg.NewManagerWithOptions(store, sp)
+	info, err := manager.CreateSession(context.Background(), sessionpkg.CreateOptions{
+		Template: "probe",
+		Title:    "Probe",
+		Command:  "claude",
+		WorkDir:  t.TempDir(),
+		Provider: "claude",
+		Resume:   sessionpkg.ProviderResume{},
+		Hints:    runtime.Config{},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	handle, err := NewSessionHandle(SessionHandleConfig{
+		Manager: manager,
+		Session: SessionSpec{
+			ID:       info.ID,
+			Command:  info.Command,
+			Provider: "claude",
+			WorkDir:  info.WorkDir,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSessionHandle: %v", err)
+	}
+	result, err := handle.Nudge(context.Background(), NudgeRequest{Text: "check deploy status"})
+	if err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	if result.Delivered || !result.Queued || !result.Accepted() {
+		t.Fatalf("Nudge result = %#v, want queued and accepted", result)
+	}
+}
+
 func TestRuntimeHandleNudgeWaitIdleClaudeWrapsReminder(t *testing.T) {
 	sp := runtime.NewFake()
 	if err := sp.Start(context.Background(), "legacy-worker", runtime.Config{}); err != nil {

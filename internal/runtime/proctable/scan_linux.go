@@ -24,6 +24,45 @@ func ScanBySessionID(id string) ([]runtime.LiveRuntime, error) {
 	return scanWithRoot(scanRoot, id)
 }
 
+// FindEnvironmentBySessionID returns the first non-empty environment value
+// named key observed in a live process belonging to id.
+func FindEnvironmentBySessionID(id, key string) (string, error) {
+	if id == "" || key == "" {
+		return "", nil
+	}
+	if err := liveScanGuard(); err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(scanRoot)
+	if err != nil {
+		return "", fmt.Errorf("enumerating %s: %w", scanRoot, err)
+	}
+	pids := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err == nil && pid > 1 {
+			pids = append(pids, pid)
+		}
+	}
+	sort.Ints(pids)
+	for _, pid := range pids {
+		env, err := parseEnvironFile(filepath.Join(scanRoot, strconv.Itoa(pid), "environ"))
+		if err != nil {
+			return "", fmt.Errorf("reading environ for pid %d: %w", pid, err)
+		}
+		if env["GC_SESSION_ID"] != id {
+			continue
+		}
+		if value := env[key]; value != "" {
+			return value, nil
+		}
+	}
+	return "", nil
+}
+
 // IsScanRoot reports whether pid is outside its GC_SESSION_ID parent's
 // envelope and should be treated as an agent root.
 func IsScanRoot(pid int) bool {

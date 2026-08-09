@@ -84,6 +84,25 @@ func TestScanWithRootFiltersBySessionID(t *testing.T) {
 	}
 }
 
+func TestFindEnvironmentBySessionID(t *testing.T) {
+	root := t.TempDir()
+	buildFakeProc(t, root, 100, map[string]string{
+		"GC_SESSION_ID":                "ga-abc",
+		"CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/claude.sock",
+	})
+	buildFakeProc(t, root, 200, map[string]string{"GC_SESSION_ID": "ga-xyz", "TARGET": "other"})
+	restore := SetScanRootForTesting(root)
+	t.Cleanup(restore)
+
+	got, err := FindEnvironmentBySessionID("ga-abc", "CLAUDE_CODE_MESSAGING_SOCKET")
+	if err != nil {
+		t.Fatalf("FindEnvironmentBySessionID: %v", err)
+	}
+	if got != "/tmp/claude.sock" {
+		t.Fatalf("socket = %q, want /tmp/claude.sock", got)
+	}
+}
+
 func TestScanWithRootEmptyIDReturnsAll(t *testing.T) {
 	root := t.TempDir()
 	buildFakeProc(t, root, 100, map[string]string{"GC_SESSION_ID": "ga-abc"})

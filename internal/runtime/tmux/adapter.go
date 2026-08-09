@@ -38,6 +38,8 @@ var (
 	_ runtime.Provider                      = (*Provider)(nil)
 	_ runtime.DeadRuntimeSessionChecker     = (*Provider)(nil)
 	_ runtime.ImmediateNudgeProvider        = (*Provider)(nil)
+	_ runtime.NudgeStatusProvider           = (*Provider)(nil)
+	_ runtime.ImmediateNudgeStatusProvider  = (*Provider)(nil)
 	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 	_ runtime.ProcessTableScanner           = (*Provider)(nil)
@@ -527,28 +529,52 @@ func (p *Provider) DismissKnownDialogs(ctx context.Context, name string, timeout
 // multi-pane resolution, retry with backoff, and SIGWINCH wake.
 // Best-effort: returns nil if the session doesn't exist.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
-	// Wait for the agent to be idle before sending, unless disabled.
-	// This prevents interrupting active tool calls — the prompt is visible
-	// in scrollback during inter-tool-call gaps, so immediate send-keys
-	// would inject text mid-execution. See upstream dfd945e9/6bc898ce.
-	if idleTimeout := p.tm.cfg.NudgeIdleTimeout; idleTimeout > 0 {
-		// Best-effort wait — if it fails (session gone, timeout), proceed
-		// with the nudge anyway. The message may arrive during active work,
-		// but Claude's cooperative queue will handle it at the next turn.
-		if err := p.tm.WaitForIdle(context.Background(), name, idleTimeout); err != nil {
-			// Not idle within the window. A mid-session Codex/GPT model-switch
-			// modal ("approaching rate limits — switch model?") blocks input and
-			// would otherwise hang the session; dismiss it (keep current model,
-			// no downgrade) so the nudge can land. No-op if the modal is absent,
-			// so this never disturbs a genuinely busy pane.
-			p.tm.DismissModelSwitchModalIfPresent(name)
+	_, err := p.NudgeWithStatus(name, content)
+	return err
+}
+
+// NudgeWithStatus sends a message through Claude's local inbox when one is
+// bound, falling back to tmux input when no inbox is available or the socket
+// write fails. An inbox write is reported as queued because the receiver has
+// not necessarily read it yet.
+func (p *Provider) NudgeWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	return p.nudgeWithClaudeInbox(name, content, func() error {
+		// Wait for the agent to be idle before sending, unless disabled.
+		// This prevents interrupting active tool calls — the prompt is visible
+		// in scrollback during inter-tool-call gaps, so immediate send-keys
+		// would inject text mid-execution. See upstream dfd945e9/6bc898ce.
+		if idleTimeout := p.tm.cfg.NudgeIdleTimeout; idleTimeout > 0 {
+			// Best-effort wait — if it fails (session gone, timeout), proceed
+			// with the nudge anyway. The message may arrive during active work,
+			// but Claude's cooperative queue will handle it at the next turn.
+			if err := p.tm.WaitForIdle(context.Background(), name, idleTimeout); err != nil {
+				// Not idle within the window. A mid-session Codex/GPT model-switch
+				// modal ("approaching rate limits — switch model?") blocks input and
+				// would otherwise hang the session; dismiss it (keep current model,
+				// no downgrade) so the nudge can land. No-op if the modal is absent,
+				// so this never disturbs a genuinely busy pane.
+				p.tm.DismissModelSwitchModalIfPresent(name)
+			}
 		}
-	}
-	return p.NudgeNow(name, content)
+		return p.nudgeNowLegacy(name, content)
+	})
 }
 
 // NudgeNow sends a message immediately without performing a wait-idle check.
 func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
+	_, err := p.NudgeNowWithStatus(name, content)
+	return err
+}
+
+// NudgeNowWithStatus sends immediately through Claude's local inbox when
+// possible, falling back to the existing tmux injection path otherwise.
+func (p *Provider) NudgeNowWithStatus(name string, content []runtime.ContentBlock) (runtime.NudgeOutcome, error) {
+	return p.nudgeWithClaudeInbox(name, content, func() error {
+		return p.nudgeNowLegacy(name, content)
+	})
+}
+
+func (p *Provider) nudgeNowLegacy(name string, content []runtime.ContentBlock) error {
 	var parts []string
 	for _, b := range content {
 		switch b.Type {
