@@ -2152,26 +2152,29 @@ func TestHandleControllerPokeAcknowledgesOnlyAfterProcessing(t *testing.T) {
 	}()
 	go handleControllerPokeWithTimeouts(server, nil, requests, time.Second, time.Second)
 
-	var req controllerPokeRequest
-	select {
-	case req = <-requests:
-	case <-time.After(time.Second):
-		t.Fatal("controller poke was not queued")
-	}
+	awaitCond(t, func() bool { return len(requests) > 0 }, "controller poke was queued")
+	req := <-requests
+
+	noAckTimer := time.NewTimer(20 * time.Millisecond)
+	defer noAckTimer.Stop()
 	select {
 	case got := <-responses:
 		t.Fatalf("poke acknowledgement arrived before processing: %q", got)
-	case <-time.After(20 * time.Millisecond):
+	case <-noAckTimer.C:
 	}
 
 	req.done <- nil
-	select {
-	case got := <-responses:
-		if got != "ok\n" {
-			t.Fatalf("poke response = %q, want ok", got)
+	var got string
+	awaitCond(t, func() bool {
+		select {
+		case got = <-responses:
+			return true
+		default:
+			return false
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for processed poke acknowledgement")
+	}, "processed poke acknowledgement")
+	if got != "ok\n" {
+		t.Fatalf("poke response = %q, want ok", got)
 	}
 }
 
@@ -2181,17 +2184,22 @@ func TestHandleControllerPokeReportsUnprocessedRequest(t *testing.T) {
 	defer client.Close() //nolint:errcheck // test connection cleanup
 
 	requests := make(chan controllerPokeRequest, 1)
+	responses := make(chan string, 1)
 	go handleControllerPokeWithTimeouts(server, nil, requests, time.Second, 5*time.Millisecond)
-	select {
-	case <-requests:
-	case <-time.After(time.Second):
-		t.Fatal("controller poke was not queued")
-	}
-
-	line, err := bufio.NewReader(client).ReadString('\n')
-	if err != nil {
-		t.Fatalf("reading failed poke response: %v", err)
-	}
+	go func() {
+		line, _ := bufio.NewReader(client).ReadString('\n')
+		responses <- line
+	}()
+	awaitCond(t, func() bool { return len(requests) > 0 }, "controller poke was queued")
+	var line string
+	awaitCond(t, func() bool {
+		select {
+		case line = <-responses:
+			return true
+		default:
+			return false
+		}
+	}, "failed poke response")
 	if !strings.Contains(line, "did not process poke") {
 		t.Fatalf("poke response = %q, want bounded processing failure", line)
 	}
